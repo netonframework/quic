@@ -326,7 +326,11 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 11. 固定的 AES-128-GCM Retry 完整性标签。
 12. Initial 套件为 TLS13_AES_128_GCM_SHA256。
 
-**TLS 的来源（建议，待用户确认）**：neton-io 已把 TLS 移出（neton-io SPEC §21、§28.1）。候选：
+**TLS 的来源（2026-09-27 用户确定）**：由另外封装的 `openssl-kotlin` 库提供（基于 OpenSSL 4.0.2），本库不自行实现 TLS，也不在此之前推进依赖 TLS 的部分。
+本库先完成与 TLS 无关的全部工作；`openssl-kotlin` 可用后，按下面的可行性验证清单确认它提供 §4 的 12 项能力（OpenSSL 的第三方 QUIC TLS 接口
+`SSL_set_quic_tls_cbs` 等），再接入。以下为此前的候选分析，保留作记录：
+
+**TLS 的来源（原建议）**：neton-io 已把 TLS 移出（neton-io SPEC §21、§28.1）。候选：
 - (a) 自研 Kotlin TLS 1.3，密码原语用 libcrypto（neton-io SPEC §18.5 评估过）。
 - (b) OpenSSL 3.5+ 为第三方 QUIC 协议栈提供的 TLS 接口（`SSL_set_quic_tls_cbs`，https://docs.openssl.org/3.5/man3/SSL_set_quic_tls_cbs/）。
 - (c) BoringSSL 的 QUIC API。
