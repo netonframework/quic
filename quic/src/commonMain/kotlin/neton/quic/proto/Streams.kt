@@ -371,9 +371,10 @@ internal class PendingStreamsQueue {
 /**
  * Application events about streams (mod.rs:480).
  *
- * ⚖️ quinn queues these enum values inline; here each event is a small object.
+ * ⚖️ quinn queues these enum values inline; here each event is a small object. It is an [Event] itself rather than
+ * wrapped in quinn's `Event::Stream`.
  */
-sealed class StreamEvent {
+sealed class StreamEvent : Event() {
     /** One or more new streams has been opened and might be readable. */
     data class Opened(val dir: Dir) : StreamEvent()
 
