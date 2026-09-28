@@ -415,3 +415,23 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 9. quic-interop-runner；性能对照。
 
 每一步单独验证、单独提交，结果记入本 SPEC。
+
+## 11. 实施记录
+
+### 11.1 步骤 1：编解码基础（2026-09-28）
+- 代码（`neton.quic.proto`）：`VarInt`、`Coding`、`Shared`（常量、`Side`、`Dir`、`StreamId`、`ConnectionId`、`ResetToken`、`IssuedCid`）、`TransportError`、`Crypto`（`HeaderKey` / `PacketKey` / `HmacKey` / `HandshakeTokenKey` / `AeadKey` 接口与 `HeaderProtection` 的包布局）、`Frame`、`Packet`、`RangeSet`、`TransportParameters`、`CidGenerator`、`Token`。
+- 测试：109 个，macosArm64 全过；linuxX64、mingwX64、androidNativeArm32 编译通过。
+  - 参考模块内测试：frame 3、packet 4、btree_range_set 7、range_set 13（对两种集合各跑一遍）、transport_parameters 8、cid_generator 1、token 3，全部移植。
+  - `headerEncoding`：参考比较真实 Initial 密钥下的密文；此处先校验未保护的头部字节、长度字段与解码路径，头部保护以 RFC 9001 附录 A 的三个例子单独校验。真实 Initial 密钥接入后（步骤 2，openssl-kotlin 已提供 AEAD / 头部保护 / HKDF-Expand-Label）补全为参考原样。
+  - `token.rs` 3 个：暂用测试内的非密码替身密钥，只验证令牌格式；步骤 2 换成 HKDF-SHA256 + AES-256-GCM（openssl-kotlin）后按参考原样验证。
+  - 另加：各帧类型、各包头类型的往返；合并包拆分；固定位 GREASE；全部解码错误路径；各包空间的帧规则（参考在 `connection/mod.rs:2715-2733、2786-2793`，此处为 `Frame.handshakeSpaceViolation()` / `zeroRttViolation()`）；RFC 9000 A.1 / A.2 / A.3 例子；FxHash 值（rustc-hash 2.1.3 生成）。
+  - 模糊测试的 4 个目标尚未建立（与步骤 2 一起补）。
+- 与 quinn 的差异：
+  - `RangeSet`：Kotlin common 没有 `BTreeMap`，改为有序 `LongArray` + 二分查找（插入 / 删除 O(n)、无分配）；行为以对照参考集合的穷举测试保证一致。
+  - 解码从 `ByteArray` + 游标读取（neton-io `Bytes` 不公开底层数组）。
+  - 错误用异常而非 `Result`；`UnexpectedEnd` 为共享单例，坏包不分配。
+  - `ConnectionIdGenerator.validate` 返回 `Boolean`；令牌中的墙钟时间为自 Unix 纪元的 `Duration`；128 位随机数为小的 `U128` 类。
+  - 连接 ID 默认用 `secureRandom`；传输参数用注入的 `Random`（同参考用端点的可设种子的生成器）。
+  - `EcnCodepoint`、`SocketAddress` 复用 neton-io。
+- §4 可行性的进展：openssl-kotlin 4.0.2 已提供 AEAD（AES-128/256-GCM、ChaCha20-Poly1305，原地）、头部保护掩码（AES / ChaCha20）、摘要、HMAC、HKDF（含 Expand-Label）、常量时间比较，覆盖 §4 第 2（Initial 部分）、3、4、10、11、12 项；
+  第 1、2（阶段密钥导出）、5–9 项需要 OpenSSL 的第三方 QUIC TLS 接口（`SSL_set_quic_tls_cbs`、`SSL_set_quic_tls_transport_params`、`SSL_set_quic_tls_early_data_enabled`），已列为对 openssl-kotlin 的封装请求。
