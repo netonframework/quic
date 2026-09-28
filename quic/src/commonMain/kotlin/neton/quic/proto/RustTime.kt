@@ -20,6 +20,65 @@ internal fun secsF64(nanos: Long): Double =
 internal fun secsF32(nanos: Long): Float =
     (nanos / NANOS_PER_SEC).toFloat() + (nanos % NANOS_PER_SEC).toFloat() / NANOS_PER_SEC.toFloat()
 
+/**
+ * Rust `Duration::mul_f32` on a nanosecond count. It forwards to `mul_f64`: `Duration::from_secs_f64(rhs as f64 *
+ * self.as_secs_f64())`, the exact conversion of [fromSecsF64]. Non-negative finite results only (Rust panics otherwise;
+ * the loss delay multiplies an RTT by the positive time threshold).
+ */
+internal fun mulF32(nanos: Long, rhs: Float): Long = fromSecsF64(rhs.toDouble() * secsF64(nanos))
+
+/**
+ * Rust `Duration::from_secs_f64` as nanoseconds (core `time.rs` `try_from_secs!` with 52 mantissa bits): the exact
+ * value of the double rounded to the nearest nanosecond, ties to even. Negative and NaN inputs give 0 and values past
+ * `Long.MAX_VALUE` nanoseconds saturate (Rust panics on both).
+ */
+internal fun fromSecsF64(secs: Double): Long {
+    if (secs.isNaN() || secs <= 0.0) return 0L
+    val bits = secs.toRawBits()
+    val mantMask = (1L shl 52) - 1
+    val mant = (bits and mantMask) or (1L shl 52)
+    val exp = ((bits ushr 52) and 0x7FF).toInt() - 1023
+    return when {
+        // the input represents less than 1ns and can not be rounded to it
+        exp < -31 -> 0L
+        exp < 0 -> {
+            // the input is less than 1 second: t = mant << (44 + exp), nanos = (1e9 * t) >> 96, rounded
+            val shift = 44 + exp
+            val tHi = if (shift == 0) 0L else mant ushr (64 - shift)
+            val tLo = mant shl shift
+            // 1e9 * t as a 128-bit hi:lo
+            val lo = tLo * NANOS_PER_SEC
+            val hi = tHi * NANOS_PER_SEC + unsignedMulHigh(tLo, NANOS_PER_SEC)
+            var nanos = hi ushr 32
+            val remMsb = (hi ushr 31) and 1L == 1L
+            val tie = remMsb && (hi and 0x7FFF_FFFFL) == 0L && lo == 0L
+            if (remMsb && !(nanos and 1L == 0L && tie)) nanos += 1
+            nanos
+        }
+        exp < 52 -> {
+            val wholeSecs = mant ushr (52 - exp)
+            val t = (mant shl exp) and mantMask
+            // 1e9 * t < 2^82 as hi:lo; nanos = product >> 52
+            val lo = t * NANOS_PER_SEC
+            val hi = unsignedMulHigh(t, NANOS_PER_SEC)
+            var nanos = (hi shl 12) or (lo ushr 52)
+            val remMsb = (lo ushr 51) and 1L == 1L
+            val tie = remMsb && (lo and ((1L shl 51) - 1)) == 0L
+            if (remMsb && !(nanos and 1L == 0L && tie)) nanos += 1
+            saturatingAddU(saturatingMulU(wholeSecs, NANOS_PER_SEC), nanos)
+        }
+        // the input has no fractional part (whole seconds past 2^63 / 10^9 saturate)
+        exp - 52 <= 10 -> saturatingMulU(mant shl (exp - 52), NANOS_PER_SEC)
+        else -> Long.MAX_VALUE
+    }
+}
+
+/** `u64::saturating_mul` on non-negative values, capped at `Long.MAX_VALUE`. */
+internal fun saturatingMulU(a: Long, b: Long): Long {
+    if (a == 0L || b == 0L) return 0L
+    return if (a > Long.MAX_VALUE / b) Long.MAX_VALUE else a * b
+}
+
 /** Rust `f64 as u64` (saturating; NaN is 0), capped at `Long.MAX_VALUE` (⚖️ no `u64` in Kotlin). */
 internal fun f64ToU64(x: Double): Long = when {
     x.isNaN() || x <= 0.0 -> 0L

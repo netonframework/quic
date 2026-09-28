@@ -347,6 +347,12 @@ internal class SentPackets {
         return if (i < 0) -1 else sizes[i]
     }
 
+    /** Whether [pn] is ack-eliciting; false when it is not stored. */
+    fun ackElicitingOf(pn: Long): Boolean {
+        val i = slotOf(pn)
+        return i >= 0 && ackEliciting[i]
+    }
+
     /** The retransmits stored with [pn], if any. */
     fun retransmitsOf(pn: Long): Retransmits? {
         val i = slotOf(pn)

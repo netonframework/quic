@@ -271,6 +271,32 @@ class TransportParameters internal constructor() {
      */
     internal var writeOrder: ByteArray? = null
 
+    /** A field-by-field copy (quinn's `Clone`; struct update syntax builds modified copies from it). */
+    internal fun copy(): TransportParameters = TransportParameters().also {
+        it.maxIdleTimeout = maxIdleTimeout
+        it.maxUdpPayloadSize = maxUdpPayloadSize
+        it.initialMaxData = initialMaxData
+        it.initialMaxStreamDataBidiLocal = initialMaxStreamDataBidiLocal
+        it.initialMaxStreamDataBidiRemote = initialMaxStreamDataBidiRemote
+        it.initialMaxStreamDataUni = initialMaxStreamDataUni
+        it.initialMaxStreamsBidi = initialMaxStreamsBidi
+        it.initialMaxStreamsUni = initialMaxStreamsUni
+        it.ackDelayExponent = ackDelayExponent
+        it.maxAckDelay = maxAckDelay
+        it.activeConnectionIdLimit = activeConnectionIdLimit
+        it.disableActiveMigration = disableActiveMigration
+        it.maxDatagramFrameSize = maxDatagramFrameSize
+        it.initialSrcCid = initialSrcCid
+        it.greaseQuicBit = greaseQuicBit
+        it.minAckDelay = minAckDelay
+        it.originalDstCid = originalDstCid
+        it.retrySrcCid = retrySrcCid
+        it.statelessResetToken = statelessResetToken
+        it.preferredAddress = preferredAddress
+        it.greaseTransportParameter = greaseTransportParameter
+        it.writeOrder = writeOrder?.copyOf()
+    }
+
     /** Check that these parameters are legal when resuming from [cached] ones (transport_parameters.rs:189). */
     internal fun validateResumptionFrom(cached: TransportParameters) {
         if (cached.activeConnectionIdLimit > activeConnectionIdLimit ||

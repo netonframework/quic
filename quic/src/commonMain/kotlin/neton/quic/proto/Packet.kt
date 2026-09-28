@@ -515,9 +515,9 @@ class PartialEncode internal constructor(
     val start: Int,
     val headerLen: Int,
     /** Packet number length, or -1 for packets without one (Retry, Version Negotiation). */
-    private val pnLen: Int,
+    internal val pnLen: Int,
     /** Whether the long header length field must be written. */
-    private val writeLen: Boolean,
+    internal val writeLen: Boolean,
 ) {
     /**
      * Complete the packet `packet[packetStart, packetEnd)` (whose header this is): write the length field,
@@ -532,22 +532,7 @@ class PartialEncode internal constructor(
         headerCrypto: HeaderKey,
         crypto: PacketKey?,
         packetNumber: Long,
-    ) {
-        if (pnLen < 0) return
-        val pnPos = headerLen - pnLen
-        if (writeLen) {
-            val len = (packetEnd - packetStart) - headerLen + pnLen
-            check(len < (1 shl 14)) { "packet length $len does not fit the reserved 2-byte field" }
-            val v = len or (0b01 shl 14)
-            packet[packetStart + pnPos - 2] = (v ushr 8).toByte()
-            packet[packetStart + pnPos - 1] = v.toByte()
-        }
-        crypto?.encrypt(packetNumber, packet, packetStart, packetEnd, headerLen)
-        check(pnPos + 4 + headerCrypto.sampleSize <= packetEnd - packetStart) {
-            "packet must be padded to at least ${pnPos + 4 + headerCrypto.sampleSize} bytes for header protection sampling"
-        }
-        headerCrypto.encrypt(pnPos, packet, packetStart, packetEnd)
-    }
+    ) = protectPacket(packet, packetStart, packetEnd, headerLen, pnLen, writeLen, headerCrypto, crypto, packetNumber)
 
     /**
      * [finish] for a packet written into [buf] starting at this header: the packet is the rest of [buf]'s
@@ -557,4 +542,36 @@ class PartialEncode internal constructor(
         val base = buf.readerIndex()
         finish(buf.backingArray(), base + start, base + buf.len, headerCrypto, crypto, packetNumber)
     }
+}
+
+/**
+ * [PartialEncode.finish] on the header layout alone ([headerLen], [pnLen], [writeLen]), for headers written without a
+ * [Header] object (the connection's 1-RTT packets): write the long header length field, encrypt, then apply header
+ * protection (packet.rs:471).
+ */
+internal fun protectPacket(
+    packet: ByteArray,
+    packetStart: Int,
+    packetEnd: Int,
+    headerLen: Int,
+    pnLen: Int,
+    writeLen: Boolean,
+    headerCrypto: HeaderKey,
+    crypto: PacketKey?,
+    packetNumber: Long,
+) {
+    if (pnLen < 0) return
+    val pnPos = headerLen - pnLen
+    if (writeLen) {
+        val len = (packetEnd - packetStart) - headerLen + pnLen
+        check(len < (1 shl 14)) { "packet length $len does not fit the reserved 2-byte field" }
+        val v = len or (0b01 shl 14)
+        packet[packetStart + pnPos - 2] = (v ushr 8).toByte()
+        packet[packetStart + pnPos - 1] = v.toByte()
+    }
+    crypto?.encrypt(packetNumber, packet, packetStart, packetEnd, headerLen)
+    check(pnPos + 4 + headerCrypto.sampleSize <= packetEnd - packetStart) {
+        "packet must be padded to at least ${pnPos + 4 + headerCrypto.sampleSize} bytes for header protection sampling"
+    }
+    headerCrypto.encrypt(pnPos, packet, packetStart, packetEnd)
 }

@@ -155,6 +155,25 @@ sealed class Frame {
 
         fun ranges(): List<LongRange> = iterator().asSequence().toList()
 
+        /**
+         * Visit the acknowledged ranges, highest first, as closed `[first, last]` (the order of [iterator]) without
+         * allocating: the connection walks every received ACK this way.
+         */
+        inline fun forEachRange(action: (first: Long, last: Long) -> Unit) {
+            val data = additional
+            var pos = 0
+            var top = largest
+            while (pos < data.size) {
+                val block = ackVarAt(data, pos)
+                pos += ackVarLen(data, pos)
+                action(top - block, top)
+                if (pos >= data.size) break
+                val gap = ackVarAt(data, pos)
+                pos += ackVarLen(data, pos)
+                top -= block + gap + 2
+            }
+        }
+
         override fun encode(out: Buffer) {
             (if (ecn != null) FrameType.ACK_ECN else FrameType.ACK).encode(out)
             out.writeVar(largest)
@@ -177,6 +196,24 @@ sealed class Frame {
             "Ack(largest=$largest, delay=$delay, ecn=$ecn, ranges=${ranges().joinToString(",", "[", "]") { "${it.first}..=${it.last}" }})"
 
         companion object {
+            /** Encoded size of the frame [encode] writes for the same arguments. */
+            fun encodedSize(delay: Long, ranges: ArrayRangeSet, ecn: EcnCounts?): Int {
+                val n = ranges.len
+                val firstStart = ranges.startAt(n - 1)
+                val firstEnd = ranges.endAt(n - 1)
+                var size = 1 + varIntSize(firstEnd - 1) + varIntSize(delay) + varIntSize(n.toLong() - 1) +
+                    varIntSize(firstEnd - firstStart - 1)
+                var prev = firstStart
+                for (i in n - 2 downTo 0) {
+                    val s = ranges.startAt(i)
+                    val e = ranges.endAt(i)
+                    size += varIntSize(prev - e - 1) + varIntSize(e - s - 1)
+                    prev = s
+                }
+                if (ecn != null) size += varIntSize(ecn.ect0) + varIntSize(ecn.ect1) + varIntSize(ecn.ce)
+                return size
+            }
+
             /** Write an ACK (or ACK_ECN when [ecn] is set) for [ranges] (frame.rs:381). [ranges] must not be empty. */
             fun encode(delay: Long, ranges: ArrayRangeSet, ecn: EcnCounts?, buf: Buffer) {
                 val n = ranges.len
@@ -450,6 +487,20 @@ sealed class Frame {
         override fun encode(out: Buffer) = FrameType.HANDSHAKE_DONE.encode(out)
     }
 }
+
+/** The varint at [pos] of validated ACK range bytes. */
+@PublishedApi
+internal fun ackVarAt(data: Bytes, pos: Int): Long {
+    val first = data[pos].toInt() and 0xFF
+    val len = 1 shl (first ushr 6)
+    var v = (first and 0x3F).toLong()
+    for (i in 1 until len) v = (v shl 8) or (data[pos + i].toLong() and 0xFF)
+    return v
+}
+
+/** Encoded length of the varint at [pos]. */
+@PublishedApi
+internal fun ackVarLen(data: Bytes, pos: Int): Int = 1 shl ((data[pos].toInt() and 0xFF) ushr 6)
 
 /**
  * Iterator over the ranges of an ACK frame, highest first, as closed ranges (frame.rs:802).

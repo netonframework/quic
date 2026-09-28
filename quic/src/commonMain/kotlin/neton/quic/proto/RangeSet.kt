@@ -198,6 +198,11 @@ class ArrayRangeSet private constructor(private val v: RangeVec) {
         if (v.n > 0) v.removeAt(0)
     }
 
+    /** Remove every range, keeping the storage (a reused set instead of quinn's `ArrayRangeSet::new()` per use). */
+    internal fun clear() {
+        v.n = 0
+    }
+
     fun min(): Long? = if (v.n == 0) null else v.starts[0]
     fun max(): Long? = if (v.n == 0) null else v.ends[v.n - 1] - 1
 
