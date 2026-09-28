@@ -451,3 +451,20 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 - 保留的 quinn 行为：`Chunks` 在检查读取顺序前从映射中取出流状态，非法有序读时该状态被丢弃且不计为释放；部分有序读后改为无序读可能重复交付已读字节（`defragment` 从偏移 0 而不是读位置裁剪），有测试固定该行为。
 - ⚖️：`FxHashMap` / `FxHashSet` / `Vec<u64>` 改为基于 `LongArray` 的 `LongMap` / `LongHashSet` / `LongList`（键不装箱，迭代顺序同样未指定）；`BinaryHeap<Buffer>` 改为平行数组的 `ChunkHeap`（逐步照搬 Rust 的 sift / pop / sort，相等块的出队顺序相同）；发送队列的优先级堆用平行数组，最近度按无符号比较；发送缓冲保留首段整体、以 `frontTrimmed` 标记起点；为避免每帧分配，元组返回值拆开（`Recv.ingest` 只返回新字节数，`Recv.stop` 只返回额度，`maxStreamData` + `maxStreamDataShouldTransmit`，`BytesSource` 累加 `chunksConsumed`）；`RecvState` 展平为字段（-1 表示最终大小未知）；会阻塞的结果以密封类返回而非抛出（K/N 抛异常代价为微秒级），误用类错误抛出；`Chunks` 必须显式结束（无析构）；句柄接收 `connClosed` 而不借用连接状态；数据报每个开销固定 32 字节；`StreamEvent` / `Chunk` / `CidQueue.Retired` / `Next` / `StreamReset` 为小对象（已打开流上每个入站 STREAM 帧一个 `StreamEvent.Readable`）；`debug_assert!` 以注释保留（同参考的发布版行为）。
 - 向 neton-io 提出：`Bytes` 的区间复制（`copyInto(dst, dstOffset, from, to)`），可省去把存储的写入部分装进包时每个 STREAM 帧一个的小切片对象。
+
+### 11.4 步骤 4–5 的组件：拥塞控制、pacing、RTT、MTU 探测、包空间、ACK（2026-09-28，不含 `connection/mod.rs`）
+- 代码（`neton.quic.proto`）：`Congestion`、`NewReno`、`Cubic`、`Bbr`（与 quinn 一样标为实验性）、`Pacing`、`Paths`（`RttEstimator`、`PathData`、
+  `PathResponses`、`InFlight`）、`Mtud`、`Spaces`（`PacketSpace`、`SentPacket`、`SentPackets`、`Dedup`、`SendableFrames`、`PendingAcks`、
+  `PacketNumberFilter`）、`AckFrequency`、`Timer`、`Stats`、`BloomTokenLog`、`TokenMemoryCache`、`SpinLock`、`TransportConfig`（含
+  `AckFrequencyConfig`、`MtuDiscoveryConfig`、`IdleTimeout`）、`Config`（`EndpointConfig`、`ValidationTokenConfig`、`ConfigError`、`TimeSource`）、
+  `RustTime`（Rust `Duration` 的精确算术）、`DebugAssert`；`nativeMain` 的 `EndpointConfig.default()` 用随机 HMAC-SHA256 重置密钥。
+- 测试：318 个（此前 229 + 89）全过；linuxX64、mingwX64、common 元数据编译通过。mtud 28、spaces 10、bloom_token_log 7、token_memory_cache 3、
+  pacing 4、paths 1、cubic 2、bbr/min_max 1、ack_frequency 2 全部移植；另加模型对照（黑洞检测、`Dedup`、`SentPackets`）、与 fastbloom 0.17.0 逐位
+  一致的向量、BBR 瓶颈链路模拟、NewReno、配置 / 计时器 / 统计。
+- ⚖️：u64 用 `Long`（`u64::MAX` 成为 `Long.MAX_VALUE`，不可达处无差别）、u16 用 `Int` 并在设置时校验范围；热路径的"无"用哨兵值（包号与探测大小
+  -1、`Instant.NONE`），可空的 `Instant` / `Int` / `Long` 在 K/N 上每次装箱；已发送包由 `BTreeMap` 改为按包号索引的平行数组环形缓冲（O(1)、无分配；
+  乱序插入抛异常，quinn 不会发生），`SentPacket` 为可变记录；`Dedup` 的 u128 为两个 Long；`SendableFrames` 为位标志值类；`detect_ecn` 的结果为枚举；
+  MTU 阶段为 `MtudPhase` + 复用的 `SearchState`；令牌日志的集合重现 hashbrown 的扩容点（在相同大小转为布隆过滤器），`TokenMemoryCache` 用按访问
+  排序的 `LinkedHashMap`，两者用自旋锁（Kotlin common 没有阻塞互斥）；`debug_assert!` 只在调试二进制中执行；BBR 默认 `Random.Default`，
+  `PacketNumberFilter` 注入 `Random`。
+- 延后：qlog（§8）；`ServerConfig` / `ClientConfig`（需要 TLS 配置，§4）；由 `TransportConfig` 生成 `TransportParameters`（连接步骤）。
