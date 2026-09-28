@@ -13,5 +13,7 @@ kotlin {
         // Packet protection, key derivation and token / reset keys (resolved from mavenLocal).
         nativeMain.dependencies { api("com.netonstream:openssl:4.0.2") }
         commonTest.dependencies { implementation(kotlin("test")) }
+        // neton-io's IoStream conformance suite (SPEC §3: streams as IoStream, neton-io SPEC §28.6).
+        nativeTest.dependencies { implementation("com.netonstream:io-testkit:0.2.0-SNAPSHOT") }
     }
 }
