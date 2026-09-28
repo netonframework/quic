@@ -96,7 +96,7 @@ class DriverBudgetTest {
 
     @Test
     fun concurrentReadIsRefused() = quicTest {
-        val (client, server, endpoint) = pair()
+        val (client, server, endpoint) = connectedPair()
         val send = client.openUni()
         send.writeAll("x".encodeToByteArray())
         val recv = server.acceptUni()
@@ -111,7 +111,7 @@ class DriverBudgetTest {
 
     @Test
     fun concurrentWriteIsRefused() = quicTest {
-        val (client, _, endpoint) = pair(TransportConfig().streamReceiveWindow(VarInt(1000)))
+        val (client, _, endpoint) = connectedPair(TransportConfig().streamReceiveWindow(VarInt(1000)))
         val send = client.openUni()
         // The peer never reads: the first write parks on flow control
         val first = launch(start = CoroutineStart.UNDISPATCHED) { runCatching { send.writeAll(ByteArray(10_000)) } }
@@ -124,7 +124,7 @@ class DriverBudgetTest {
     /** Closing a stream while another coroutine waits on it resumes that coroutine instead of leaving it parked. */
     @Test
     fun closeResumesParkedRead() = quicTest {
-        val (client, server, endpoint) = pair()
+        val (client, server, endpoint) = connectedPair()
         val send = client.openUni()
         send.writeAll("x".encodeToByteArray())
         val recv = server.acceptUni()
@@ -139,7 +139,7 @@ class DriverBudgetTest {
 
     @Test
     fun closeResumesParkedWrite() = quicTest {
-        val (client, _, endpoint) = pair(TransportConfig().streamReceiveWindow(VarInt(1000)))
+        val (client, _, endpoint) = connectedPair(TransportConfig().streamReceiveWindow(VarInt(1000)))
         val send = client.openUni()
         val write = async(start = CoroutineStart.UNDISPATCHED) { runCatching { send.writeAll(ByteArray(10_000)) } }
         assertTrue(write.isActive, "the write should be parked")
@@ -147,14 +147,5 @@ class DriverBudgetTest {
         val e = write.await().exceptionOrNull()
         assertEquals(WriteError.ClosedStream(), e, "a write parked on a closed stream fails with ClosedStream")
         endpoint.shutdown()
-    }
-
-    private data class Pair3(val client: Connection, val server: Connection, val endpoint: Endpoint)
-
-    private suspend fun kotlinx.coroutines.CoroutineScope.pair(transport: TransportConfig = TransportConfig()): Pair3 {
-        val endpoint = endpointWithConfig(transport)
-        val clientD = async { endpoint.connect(endpoint.localAddr(), "localhost").await() }
-        val server = assertNotNull(endpoint.accept()).await()
-        return Pair3(clientD.await(), server, endpoint)
     }
 }

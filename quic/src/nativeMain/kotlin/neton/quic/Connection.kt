@@ -38,9 +38,10 @@ import neton.quic.proto.SendDatagramError as ProtoSendDatagramError
  * In-progress connection attempt (connection.rs:37). [await] completes when the handshake does.
  *
  * ⚖️ quinn's `Connecting` is a future consumed by `.await` or `into_0rtt`; here those calls hand the connection out
- * once, and later calls throw [IllegalStateException].
+ * once, and later calls throw [IllegalStateException]. quinn closes the connection with code 0 when a `Connecting`
+ * that never yielded it is dropped; here [close] does that.
  */
-class Connecting internal constructor(state: ConnectionState) {
+class Connecting internal constructor(state: ConnectionState) : AutoCloseable {
     private var state: ConnectionState? = state
 
     private fun live(): ConnectionState = state ?: throw IllegalStateException("used after yielding a connection")
@@ -79,6 +80,17 @@ class Connecting internal constructor(state: ConnectionState) {
 
     /** The peer's UDP address. */
     fun remoteAddress(): SocketAddress = live().inner.remoteAddress()
+
+    /**
+     * ⚖️ quinn: dropping a `Connecting` that never yielded its connection drops the last handle to it, which closes
+     * the connection with code 0 and an empty reason. Does nothing once [await] or [into0Rtt] has handed the
+     * connection out (it is then the [Connection]'s to close). Idempotent.
+     */
+    override fun close() {
+        val conn = state ?: return
+        state = null
+        if (!conn.inner.isClosed) conn.implicitClose()
+    }
 
     /** Wait for the handshake to complete. Throws [ConnectionError] if the connection could not be established. */
     suspend fun await(): Connection {

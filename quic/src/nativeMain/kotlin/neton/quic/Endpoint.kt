@@ -152,10 +152,11 @@ class Endpoint private constructor(
      */
     suspend fun accept(): Incoming? {
         while (true) {
-            if (driverLost || stopped) return null
+            // Released: quinn's `accept` needs a live handle
+            if (driverLost || stopped || released) return null
             val next = incoming.removeFirstOrNull()
             if (next != null) return Incoming(next, this).also { outstandingIncoming.add(it) }
-            if (closeCode != null || released) return null
+            if (closeCode != null) return null
             incomingNotify.await()
         }
     }
@@ -243,15 +244,25 @@ class Endpoint private constructor(
     }
 
     /**
-     * ⚖️ quinn: dropping the last `Endpoint` handle. The endpoint accepts no new connections; once its remaining
-     * connections are gone, its receive loop stops, the socket is closed and incoming connection attempts that were
-     * never handled are refused. Idempotent.
+     * ⚖️ quinn: dropping the last `Endpoint` handle. The endpoint accepts no new connections ([accept] returns `null`,
+     * new connection attempts are refused); every [Incoming] handed out by [accept] and not yet disposed of is refused
+     * now (quinn refuses an `Incoming` when it is dropped). Its existing connections carry on; once they are gone, the
+     * receive loop stops, the socket is closed, and attempts that were queued but never handed out are ignored (quinn
+     * `State::drop`). Idempotent.
      */
     override fun close() {
         if (released) return
         released = true
+        // quinn refuses an `Incoming` when it is dropped; one still held when the endpoint is released is refused now
+        refuseOutstanding()
         incomingNotify.notifyWaiters()
         stopIfDone()
+    }
+
+    /** Refuse the [Incoming]s handed out by [accept] and not yet disposed of (SPEC §3 lifecycle). */
+    private fun refuseOutstanding() {
+        if (outstandingIncoming.isEmpty()) return
+        for (incoming in outstandingIncoming.toList()) incoming.close()
     }
 
     // ---- connections ----
@@ -529,7 +540,7 @@ class Endpoint private constructor(
         if (!released || connectionCount > 0 || stopped) return
         // quinn `State::drop` ignores the connection attempts never handed out; an `Incoming` dropped unhandled is refused.
         while (true) inner.ignore(incoming.removeFirstOrNull() ?: break)
-        for (incoming in outstandingIncoming.toList()) incoming.close()
+        refuseOutstanding()
         stopped = true
         incomingNotify.notifyWaiters()
         idleNotify.notifyWaiters()

@@ -1,6 +1,7 @@
 package neton.quic
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeout
 import neton.io.net.SocketAddress
@@ -77,3 +78,13 @@ internal suspend fun bindLocalV4(): UdpSocket = bindUdp(V4_LOCALHOST)
 
 /** Deterministic test data (quinn's `gen_data` uses a seeded `StdRng`; ⚖️ this is Kotlin's seeded generator). */
 internal fun genData(size: Int, seed: Long): ByteArray = kotlin.random.Random(seed).nextBytes(size)
+
+/** A client and a server connection on one endpoint connected to itself. */
+internal data class ConnectedPair(val client: Connection, val server: Connection, val endpoint: Endpoint)
+
+internal suspend fun CoroutineScope.connectedPair(transport: TransportConfig = TransportConfig()): ConnectedPair {
+    val endpoint = endpointWithConfig(transport)
+    val clientD = async { endpoint.connect(endpoint.localAddr(), "localhost").await() }
+    val server = checkNotNull(endpoint.accept()).await()
+    return ConnectedPair(clientD.await(), server, endpoint)
+}
