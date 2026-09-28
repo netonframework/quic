@@ -46,8 +46,6 @@ class DriverBudgetTest {
         val tx = Transmit(64)
         tx.length = 20
         tx.setDestination(target)
-        val count = 1_000
-        repeat(count) { flooder.trySend(tx) }
         // Meanwhile another coroutine counts how often it gets the thread: the receive loop must let it in.
         var otherRuns = 0
         val other = launch {
@@ -56,14 +54,25 @@ class DriverBudgetTest {
                 yield()
             }
         }
+        // Bursts well above the turn's limit, small enough for a default receive buffer (Linux keeps a few hundred
+        // small datagrams; with a batch size of 32, a turn then ends in the middle of a received batch)
         val stats = server.driverStats
+        val count = 2_000
+        repeat(count / 100) {
+            repeat(100) { flooder.trySend(tx) }
+            delay(2.milliseconds)
+        }
         val deadline = kotlin.time.TimeSource.Monotonic.markNow() + 5.seconds
-        while (stats.receivedMessages < count / 2 && deadline.hasNotPassedNow()) delay(10.milliseconds)
+        while (stats.receivedMessages < count / 4 && deadline.hasNotPassedNow()) delay(10.milliseconds)
         other.cancel()
         tx.close()
         flooder.close()
 
-        assertTrue(stats.receivedMessages >= count / 2, "only ${stats.receivedMessages} datagrams arrived")
+        println(
+            "receive budget: ${stats.receivedMessages} messages, ${stats.receiveYields} yields, " +
+                "max ${stats.maxMessagesInTurn} per turn (limit $limit), other coroutine ran $otherRuns times",
+        )
+        assertTrue(stats.receivedMessages >= count / 4, "only ${stats.receivedMessages} datagrams arrived")
         assertTrue(stats.maxMessagesInTurn <= limit, "a turn handled ${stats.maxMessagesInTurn} > $limit messages")
         assertTrue(
             stats.receiveYields >= stats.receivedMessages / limit / 2,
@@ -88,6 +97,10 @@ class DriverBudgetTest {
         assertContentEquals(data, reader.await())
 
         val stats = endpoint.driverStats
+        println(
+            "send budget: max ${stats.maxDatagramsInDrive} datagrams per drive, max ${stats.maxSegmentsInTransmit} " +
+                "segments per transmit, ${stats.transmitYields} yields",
+        )
         assertTrue(stats.maxDatagramsInDrive <= 20, "a drive sent ${stats.maxDatagramsInDrive} datagrams")
         assertTrue(stats.maxSegmentsInTransmit <= 10, "a transmit had ${stats.maxSegmentsInTransmit} segments")
         assertTrue(stats.transmitYields > 0, "a 4 MiB transfer never used a full send budget")

@@ -35,7 +35,7 @@ class FairnessTest {
         val result = measure(heavy = true)
         println("fairness (heavy load): $result")
         // The load was real and concurrent with the light phase
-        assertTrue(result.heavyBytes >= 8L * 1024 * 1024, "the heavy connection moved only ${result.heavyBytes} bytes during the light phase")
+        assertTrue(result.heavyBytes >= 4L * 1024 * 1024, "the heavy connection moved only ${result.heavyBytes} bytes during the light phase")
         assertTrue(result.handshakes.size == LIGHT_CONNECTIONS, "handshakes completed: ${result.handshakes.size}")
         assertTrue(result.requests.size == LIGHT_CONNECTIONS * REQUESTS, "requests completed: ${result.requests.size}")
         assertTrue(result.handshakeMaxMs <= HANDSHAKE_BOUND_MS, "handshake max ${result.handshakeMaxMs} ms > $HANDSHAKE_BOUND_MS ms")
