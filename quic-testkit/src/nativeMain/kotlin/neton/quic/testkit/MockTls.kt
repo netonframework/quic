@@ -1,12 +1,14 @@
-package neton.quic.proto
+package neton.quic.testkit
+
+import neton.quic.proto.*
 
 import neton.io.bytes.Buffer
 import neton.io.bytes.Bytes
 import neton.openssl.Crypto
 import kotlin.random.Random
 
-// A deterministic stand-in for the TLS 1.3 layer, for tests only (SPEC §4): it exists in the test source set and no
-// production configuration can reach it.
+// A deterministic stand-in for the TLS 1.3 layer, for tests only (SPEC §4): it lives in the separate test-only artifact
+// com.netonstream:quic-testkit, which production code must not depend on; it does no real TLS.
 //
 // It is not TLS. The two sides exchange fixed, TLS-shaped handshake messages over CRYPTO frames (ClientHello /
 // ServerHello at the Initial level; EncryptedExtensions, Certificate and Finished at the Handshake level; a
@@ -30,7 +32,7 @@ private object Msg {
 }
 
 /** TLS alert descriptions used by the mock. */
-internal object MockAlert {
+object MockAlert {
     const val UNEXPECTED_MESSAGE = 10
     const val DECODE_ERROR = 50
     const val DECRYPT_ERROR = 51
@@ -41,7 +43,7 @@ internal object MockAlert {
 class MockHandshakeData(val protocol: ByteArray?, val serverName: String?)
 
 /** A session ticket as the client and the server remember it. */
-internal class MockTicket(
+class MockTicket(
     val id: ByteArray,
     val resumptionSecret: ByteArray,
     val suite: CipherSuite,
@@ -61,8 +63,8 @@ class MockServerCrypto(
     /** Whether tickets allow 0-RTT (rustls `max_early_data_size`, which quinn sets to `u32::MAX`). */
     var enableEarlyData: Boolean = true,
 ) : CryptoServerConfig {
-    internal val rng = Random(0x5e11)
-    internal val tickets = HashMap<String, MockTicket>()
+    val rng = Random(0x5e11)
+    val tickets = HashMap<String, MockTicket>()
 
     override fun initialKeys(version: Int, dstCid: ConnectionId): Keys = neton.quic.proto.initialKeys(version, dstCid, Side.Server)
 
@@ -84,17 +86,17 @@ class MockClientCrypto(
     /** Whether to send 0-RTT data when a ticket allows it (rustls `enable_early_data`, set by quinn). */
     var enableEarlyData: Boolean = true,
 ) : CryptoClientConfig {
-    internal val rng = Random(0xc11e)
+    val rng = Random(0xc11e)
 
     /** Session tickets by server name (single use, like rustls's client session cache). */
-    internal val tickets = HashMap<String, MockTicket>()
+    val tickets = HashMap<String, MockTicket>()
 
     override fun startSession(version: Int, serverName: String, params: TransportParameters): CryptoSession =
         MockSession(Side.Client, version, params, client = this, serverName = serverName)
 }
 
 /** One side of a mock handshake. */
-class MockSession internal constructor(
+class MockSession constructor(
     private val side: Side,
     private val version: Int,
     params: TransportParameters,
@@ -440,3 +442,15 @@ class MockSession internal constructor(
             TransportError(TransportErrorCode.crypto(description), null, reason)
     }
 }
+
+// Hex for the test double's log and ticket keys (quic's own helper is internal).
+private fun ByteArray.toHex(from: Int = 0, to: Int = size): String {
+    val digits = "0123456789abcdef"
+    val sb = StringBuilder((to - from) * 2)
+    for (i in from until to) {
+        val b = this[i].toInt() and 0xFF
+        sb.append(digits[b ushr 4]).append(digits[b and 0xF])
+    }
+    return sb.toString()
+}
+

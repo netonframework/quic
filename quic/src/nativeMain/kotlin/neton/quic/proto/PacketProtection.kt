@@ -88,8 +88,11 @@ private const val LABEL_IV = "quic iv"
 private const val LABEL_HP = "quic hp"
 private const val LABEL_KU = "quic ku"
 
-/** HKDF-Expand-Label with an empty context (RFC 8446 §7.1). */
-internal fun expandLabel(hash: DigestAlgorithm, secret: ByteArray, label: String, length: Int): ByteArray {
+/**
+ * HKDF-Expand-Label with an empty context (RFC 8446 §7.1). Public as a building block for [CryptoSession]
+ * implementations (the TLS layer derives each level's keys from its secrets); applications do not need it.
+ */
+fun expandLabel(hash: DigestAlgorithm, secret: ByteArray, label: String, length: Int): ByteArray {
     val out = ByteArray(length)
     Crypto.hkdfExpandLabel(hash, secret, label, EMPTY, out)
     return out
@@ -187,8 +190,11 @@ fun initialSecrets(version: TlsQuicVersion, dstCid: ConnectionId, side: Side): S
 fun initialKeys(version: Int, dstCid: ConnectionId, side: Side): Keys =
     initialSecrets(TlsQuicVersion.of(version), dstCid, side).keys()
 
-/** Packet protection key for one direction (rustls `KeyBuilder::packet_key`: "quic key" and "quic iv"). */
-internal fun packetKey(suite: CipherSuite, secret: ByteArray): PacketKey {
+/**
+ * Packet protection key for one direction (rustls `KeyBuilder::packet_key`: "quic key" and "quic iv"). Public as a
+ * building block for [CryptoSession] implementations; the caller owns the key and closes it when retired.
+ */
+fun packetKey(suite: CipherSuite, secret: ByteArray): PacketKey {
     val key = expandLabel(suite.hash, secret, LABEL_KEY, suite.keyLen)
     val iv = expandLabel(suite.hash, secret, LABEL_IV, NONCE_LEN)
     try {
@@ -198,8 +204,11 @@ internal fun packetKey(suite: CipherSuite, secret: ByteArray): PacketKey {
     }
 }
 
-/** Header protection key for one direction (rustls `KeyBuilder::header_protection_key`: "quic hp"). */
-internal fun headerKey(suite: CipherSuite, secret: ByteArray): HeaderKey {
+/**
+ * Header protection key for one direction (rustls `KeyBuilder::header_protection_key`: "quic hp"). Public as a
+ * building block for [CryptoSession] implementations; the caller owns the key and closes it when retired.
+ */
+fun headerKey(suite: CipherSuite, secret: ByteArray): HeaderKey {
     val key = expandLabel(suite.hash, secret, LABEL_HP, suite.keyLen)
     try {
         return OpenSslHeaderKey(suite, key)

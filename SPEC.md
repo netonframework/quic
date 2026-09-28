@@ -615,4 +615,9 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   重载下握手 p50 26 / 最大 33 ms、请求 p50 21 / p99 33 / 最大 33 ms（400 个请求，重载连接 1,010 ms 传 10 MiB）；无重载基线握手最大 4 ms、
   请求 p99 6 ms。预算测试：每轮至多 8 个（上限 8）、每次驱动至多 20 个数据报、每次发送至多 10 个分段。重载下的延迟仍是共享接收队列中的排队，
   不是某个连接被饿死；按 neton-io §28.4 规程的正式负载对照尚未做。
+- `quic-testkit`（2026-09-29）：TLS 测试替身 `MockTls` 移入独立的仅测试产物 `com.netonstream:quic-testkit`（包 `neton.quic.testkit`），
+  供本库与其上的协议（http3）的测试使用，生产代码不得依赖；`expandLabel` / `packetKey` / `headerKey` 公开为 `CryptoSession` 实现的构件
+  （真实 TLS 会话同样需要）。quic 与 quic-testkit 配置 `maven-publish` 以供本地消费。153 上两种驱动各 490 个测试全过。
+- 公平性测试对宿主负载敏感：本机负载平均值约 200（其他编译任务并行）时请求 p99 达 290–335 ms，超出 250 ms 上限；空闲的 153 上稳定通过。
+  该测试应在空闲机器上运行判定。
 

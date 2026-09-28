@@ -1,5 +1,7 @@
 package neton.quic
 
+import neton.quic.testkit.*
+
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -10,8 +12,8 @@ import neton.io.net.bindUdp
 import neton.io.net.runReactor
 import neton.quic.proto.ClientConfig
 import neton.quic.proto.EndpointConfig
-import neton.quic.proto.MockClientCrypto
-import neton.quic.proto.MockServerCrypto
+import neton.quic.testkit.MockClientCrypto
+import neton.quic.testkit.MockServerCrypto
 import neton.quic.proto.ServerConfig
 import neton.quic.proto.TransportConfig
 import neton.quic.proto.VarInt
