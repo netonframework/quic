@@ -27,6 +27,9 @@ class RecvStream internal constructor(
 ) : AutoCloseable {
     private var allDataRead = false
 
+    /** Whether a read (or [receivedReset]) is in progress (quinn's `&mut self` makes a second one impossible). */
+    private var reading = false
+
     /** A reset returned together with data by an earlier read, reported by the next one (quinn `reset`). */
     private var reset: VarInt? = null
 
@@ -37,6 +40,10 @@ class RecvStream internal constructor(
      */
     suspend fun read(buf: ByteArray, from: Int = 0, to: Int = buf.size): Int {
         if (from == to) return 0
+        return exclusive { readLoop(buf, from, to) }
+    }
+
+    private suspend fun readLoop(buf: ByteArray, from: Int, to: Int): Int {
         while (true) {
             if (allDataRead) return -1
             beginRead()
@@ -103,7 +110,10 @@ class RecvStream internal constructor(
      * order and the chunk's offset indicates where it fits. Slightly more efficient than [read] due to not copying.
      * Throws [ReadError].
      */
-    suspend fun readChunk(maxLength: Int = Int.MAX_VALUE, ordered: Boolean = true): Chunk? {
+    suspend fun readChunk(maxLength: Int = Int.MAX_VALUE, ordered: Boolean = true): Chunk? =
+        exclusive { readChunkLoop(maxLength, ordered) }
+
+    private suspend fun readChunkLoop(maxLength: Int, ordered: Boolean): Chunk? {
         while (true) {
             if (allDataRead) return null
             beginRead()
@@ -142,6 +152,10 @@ class RecvStream internal constructor(
      */
     suspend fun readChunks(bufs: Array<Bytes>): Int {
         if (bufs.isEmpty()) return 0
+        return exclusive { readChunksLoop(bufs) }
+    }
+
+    private suspend fun readChunksLoop(bufs: Array<Bytes>): Int {
         while (true) {
             if (allDataRead) return -1
             beginRead()
@@ -211,7 +225,8 @@ class RecvStream internal constructor(
         conn.wake()
         allDataRead = true
         // Clean up shared state that might be left over from a cancelled read operation, so `close` doesn't have to
-        conn.blockedReaders.remove(id.value)
+        // (a read still waiting is resumed and finds the stream stopped)
+        conn.releaseWaiter(id, conn.blockedReaders)
     }
 
     /** Check if this stream has been opened during 0-RTT (and may therefore be replayed by an attacker). */
@@ -222,7 +237,9 @@ class RecvStream internal constructor(
      * error code if the stream was reset, `null` if it was otherwise closed (finished, or stopped by us). Throws
      * [ResetError].
      */
-    suspend fun receivedReset(): VarInt? {
+    suspend fun receivedReset(): VarInt? = exclusive { receivedResetLoop() }
+
+    private suspend fun receivedResetLoop(): VarInt? {
         while (true) {
             if (is0rtt && !conn.check0rtt()) throw ResetError.ZeroRttRejected()
             reset?.let { return it }
@@ -248,9 +265,9 @@ class RecvStream internal constructor(
      * the peer stops sending. Idempotent.
      */
     override fun close() {
+        // Clean up any previously registered wakers (a read still waiting is resumed and finds the stream closed)
+        conn.releaseWaiter(id, conn.blockedReaders)
         if (allDataRead) return
-        // Clean up any previously registered wakers
-        conn.blockedReaders.remove(id.value)
 
         if (conn.error != null || (is0rtt && !conn.check0rtt())) return
         try {
@@ -265,6 +282,20 @@ class RecvStream internal constructor(
     override fun toString(): String = "RecvStream($id)"
 
     // ---- quinn `poll_read_generic` ----
+
+    /**
+     * ⚖️ One read at a time: quinn's reads borrow the stream mutably; here a second concurrent read throws
+     * [IllegalStateException] (it would otherwise replace the first one's wake-up and leave it waiting forever).
+     */
+    private inline fun <T> exclusive(body: () -> T): T {
+        check(!reading) { "concurrent read on $this" }
+        reading = true
+        try {
+            return body()
+        } finally {
+            reading = false
+        }
+    }
 
     private fun beginRead() {
         if (is0rtt && !conn.check0rtt()) throw ReadError.ZeroRttRejected()

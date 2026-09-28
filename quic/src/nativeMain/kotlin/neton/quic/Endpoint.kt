@@ -39,17 +39,23 @@ import neton.quic.proto.Connection as ProtoConnection
 import neton.quic.proto.Endpoint as ProtoEndpoint
 import neton.quic.proto.Incoming as ProtoIncoming
 import neton.quic.proto.Transmit as ProtoTransmit
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.microseconds
 
 // The coroutine driver of an endpoint (quinn `endpoint.rs`) on a neton-io reactor.
 //
 // ⚖️ Concurrency model (SPEC §3, single-reactor endpoint): an endpoint, its UDP socket and all of its connections live
-// on the reactor that created the endpoint. There is no mutex and there are no channels: quinn's endpoint driver task
-// and per-connection driver tasks exchange events over unbounded channels under a lock; here the receive loop hands a
-// datagram's `ConnectionEvent` straight to its connection's queue and wakes the connection's driver, and a connection
-// driver calls the protocol endpoint directly with its `EndpointEvent`s. Each connection still has its own driver
-// coroutine (quinn's `ConnectionDriver`), and the budgets are quinn's: the receive loop is time-sliced by
-// `WorkLimiter` (50 µs, `RECV_TIME_BOUND`), a connection driver sends at most 20 datagrams per round in batches of
-// at most 10 segments; either yields to the reactor's task queue when its budget is spent.
+// on the reactor that created the endpoint. There is no state mutex and there are no channels: quinn's endpoint driver
+// task and per-connection driver tasks exchange events over unbounded channels under a lock; here the receive loop
+// hands a datagram's `ConnectionEvent` straight to its connection's queue and wakes the connection's driver, and a
+// connection driver calls the protocol endpoint directly with its `EndpointEvent`s. Each connection still has its own
+// driver coroutine (quinn's `ConnectionDriver`). Budgets (SPEC §3): a receive turn handles at most
+// `DriverConfig.maxDatagramsPerTurn` messages or `DriverConfig.recvTimeBudget` (quinn's `WorkLimiter`), whichever
+// comes first; a connection driver sends at most 20 datagrams per drive in transmits of at most 10 segments. Either
+// re-queues itself at the end of the reactor's task queue when its budget is spent, so drivers with work left take
+// turns in FIFO order (the round-robin over connections). The one suspending primitive is `sendLock`, the FIFO in
+// which connections wait for a full socket (neton-io allows one parked send per socket); it is only ever taken on
+// the reactor thread.
 //
 // ⚖️ Lifetime (SPEC §3): quinn's endpoint driver ends when every `Endpoint` handle is dropped and no connection is
 // left. Kotlin has no destructors: [Endpoint.close] with no arguments stands for dropping the last handle. The
@@ -66,6 +72,7 @@ class Endpoint private constructor(
     config: EndpointConfig,
     serverConfig: ServerConfig?,
     socket: UdpSocket,
+    private val driverConfig: DriverConfig,
     private val job: CompletableJob,
     internal val scope: CoroutineScope,
 ) : AutoCloseable {
@@ -107,6 +114,9 @@ class Endpoint private constructor(
     private var stopped = false
 
     private val stats = EndpointStats()
+
+    /** Counters of the driver's budgets, for tests. */
+    internal val driverStats = DriverStats()
     private val incomingNotify = Notify()
     private val idleNotify = Notify()
 
@@ -328,39 +338,61 @@ class Endpoint private constructor(
     }
 
     /**
-     * quinn `RecvState::poll_socket` as a loop: receive a batch (suspending while the socket is empty), route each
-     * datagram, and yield to the reactor's task queue once the work limiter's time slice is spent.
+     * quinn `RecvState::poll_socket` as a loop: receive a batch (suspending while the socket is empty) and route its
+     * datagrams, within the receive budget of SPEC §3: a turn handles at most [DriverConfig.maxDatagramsPerTurn]
+     * received messages, and ends earlier once quinn's `WorkLimiter` says the turn's [DriverConfig.recvTimeBudget] is
+     * spent. The loop then re-queues itself at the end of the reactor's task queue ([yield]) instead of carrying on;
+     * messages of the batch left unhandled are handled first in the next turn.
+     *
+     * ⚖️ quinn starts a new cycle on every poll of its driver, i.e. on every wake-up. A coroutine cannot tell whether
+     * [UdpSocket.recv] parked, so here a turn runs from one yield to the next: a park inside it does not start a new
+     * turn (and the time parked does not count, see [busyClock]). The budget is therefore an upper bound on the work
+     * done per wake-up; a turn that spans a park only yields sooner than quinn would.
      */
     private suspend fun receiveLoop(socket: UdpSocket) {
         val slotSize = (minOf(maxUdpPayloadSize, 64 * 1024) * maxOf(1, socket.groSegments)).coerceAtMost(1 shl 20)
         val batch = RecvBatch(BATCH_SIZE, slotSize)
-        val limiter = WorkLimiter(RECV_TIME_BOUND_NANOS)
+        val limiter = WorkLimiter(driverConfig.recvTimeBudget.inWholeNanoseconds)
+        val maxPerTurn = driverConfig.maxDatagramsPerTurn
+        var received = 0 // messages in the batch
+        var next = 0 // the first message of the batch not yet handled
+        var turn = 0 // messages handled in this turn
         try {
             limiter.startCycle(busyClock)
             while (true) {
-                val parkStart = monotonicNanos()
-                val n = try {
-                    socket.recv(batch)
-                } catch (e: ClosedException) {
-                    return // closed by rebind or shutdown
+                if (next == received) {
+                    val parkStart = monotonicNanos()
+                    received = try {
+                        socket.recv(batch)
+                    } catch (e: ClosedException) {
+                        return // closed by rebind or shutdown
+                    }
+                    parkedNanos += monotonicNanos() - parkStart
+                    next = 0
                 }
-                parkedNanos += monotonicNanos() - parkStart
-                limiter.recordWork(n)
+                val end = minOf(received, next + (maxPerTurn - turn))
                 val now = now()
                 var receivedConnectionPacket = false
                 var remote: SocketAddress? = null
-                for (i in 0 until n) {
+                for (i in next until end) {
                     if (remote == null || !batch.sourceEquals(i, remote)) remote = batch.source(i)
                     if (handleSlot(batch, i, remote, now, socket)) receivedConnectionPacket = true
                 }
+                limiter.recordWork(end - next)
+                turn += end - next
+                driverStats.receivedMessages += end - next
+                next = end
                 if (incoming.isNotEmpty()) incomingNotify.notifyWaiters()
                 if (receivedConnectionPacket && socket === this.socket) {
                     // Traffic has arrived on the new socket, therefore there is no need for the abandoned one anymore.
                     prevSocket?.close()
                     prevSocket = null
                 }
-                if (!limiter.allowWork(busyClock)) {
+                if (turn > driverStats.maxMessagesInTurn) driverStats.maxMessagesInTurn = turn
+                if (turn >= maxPerTurn || !limiter.allowWork(busyClock)) {
                     limiter.finishCycle(busyClock)
+                    driverStats.receiveYields += 1
+                    turn = 0
                     yield()
                     limiter.startCycle(busyClock)
                 }
@@ -452,7 +484,17 @@ class Endpoint private constructor(
                 val tx = blockedTransmit?.takeIf { it.buffer.size >= t.size }
                     ?: Transmit(maxOf(TRANSMIT_CAPACITY, t.size)).also { blockedTransmit?.close(); blockedTransmit = it }
                 fill(tx, t, copy, 0)
-                socket.send(tx)
+                while (true) {
+                    val target = socket
+                    try {
+                        target.send(tx)
+                        break
+                    } catch (e: ClosedException) {
+                        // The abandoned socket of a rebind was closed under the wait: send on the new one (quinn's
+                        // connection switches sockets on `ConnectionEvent::Rebind` and retries its buffered transmit).
+                        if (target === socket || stopped) throw e
+                    }
+                }
             }
         } finally {
             blockedSenders -= 1
@@ -522,16 +564,18 @@ class Endpoint private constructor(
          * Construct an endpoint with arbitrary configuration and socket (quinn `Endpoint::new`). Must be called on the
          * reactor [socket] was bound on; the endpoint's coroutines become children of the calling coroutine.
          */
-        suspend fun create(config: EndpointConfig, serverConfig: ServerConfig?, socket: UdpSocket): Endpoint {
+        suspend fun create(
+            config: EndpointConfig,
+            serverConfig: ServerConfig?,
+            socket: UdpSocket,
+            driverConfig: DriverConfig = DriverConfig(),
+        ): Endpoint {
             val context = currentCoroutineContext()
             val job = Job(context[Job])
-            val endpoint = Endpoint(config, serverConfig, socket, job, CoroutineScope(context + job))
+            val endpoint = Endpoint(config, serverConfig, socket, driverConfig, job, CoroutineScope(context + job))
             endpoint.startReceiving(socket)
             return endpoint
         }
-
-        /** quinn `RECV_TIME_BOUND`: 50 µs. */
-        internal const val RECV_TIME_BOUND_NANOS = 50_000L
 
         /**
          * The maximum amount of datagrams that are sent in a single transmit (quinn `MAX_TRANSMIT_SEGMENTS`). This can
@@ -542,6 +586,45 @@ class Endpoint private constructor(
 
         private const val TRANSMIT_CAPACITY = 65535
     }
+}
+
+/**
+ * The receive budget of the endpoint's driver (SPEC §3): the reactor's round budget counts tasks, not how much work one
+ * task does, so the receive loop bounds itself. ⚖️ quinn has only the time slice (the constant `RECV_TIME_BOUND`,
+ * applied through `WorkLimiter`); the count cap is this library's, sized as quinn's `IO_LOOP_BOUND` (160, the bound
+ * of its endpoint-event loop), i.e. five batch receives of 32.
+ */
+class DriverConfig(
+    /** The most received messages (a GRO message may hold several datagrams) handled per turn: 32 × 5. */
+    val maxDatagramsPerTurn: Int = 32 * 5,
+    /** The time a receive turn may take (quinn `RECV_TIME_BOUND`), enforced by quinn's `WorkLimiter`. */
+    val recvTimeBudget: Duration = 50.microseconds,
+) {
+    init {
+        require(maxDatagramsPerTurn > 0) { "maxDatagramsPerTurn must be positive" }
+        require(recvTimeBudget.isPositive()) { "recvTimeBudget must be positive" }
+    }
+}
+
+/** Counters of the driver's budgets (tests check that the budgets hold). */
+internal class DriverStats {
+    /** Received messages handled. */
+    var receivedMessages = 0L
+
+    /** Times the receive loop re-queued itself because its turn's budget was spent. */
+    var receiveYields = 0L
+
+    /** The most messages handled in one receive turn. */
+    var maxMessagesInTurn = 0
+
+    /** Times a connection driver re-queued itself because its send budget was spent. */
+    var transmitYields = 0L
+
+    /** The most datagrams a connection driver sent in one drive. */
+    var maxDatagramsInDrive = 0
+
+    /** The most segments in one transmit. */
+    var maxSegmentsInTransmit = 0
 }
 
 /** Statistics on [Endpoint] activity (endpoint.rs:341). */

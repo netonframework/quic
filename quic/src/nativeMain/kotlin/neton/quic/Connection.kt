@@ -501,14 +501,21 @@ internal class ConnectionState(
         val buf = endpoint.sendBuffer
         while (true) {
             buf.clear()
-            val t = inner.pollTransmit(now, maxDatagrams, buf) ?: return false
+            // ⚖️ quinn asks for up to `max_datagrams` segments every time and so may overshoot MAX_TRANSMIT_DATAGRAMS by
+            // up to 9; asking for no more than what is left keeps the drive's bound exact (SPEC §3).
+            val t = inner.pollTransmit(now, minOf(maxDatagrams, MAX_TRANSMIT_DATAGRAMS - transmits), buf) ?: return false
             val segmentSize = t.segmentSize
-            transmits += if (segmentSize == null) 1 else (t.size + segmentSize - 1) / segmentSize
+            val segments = if (segmentSize == null) 1 else (t.size + segmentSize - 1) / segmentSize
+            transmits += segments
+            val stats = endpoint.driverStats
+            if (segments > stats.maxSegmentsInTransmit) stats.maxSegmentsInTransmit = segments
+            if (transmits > stats.maxDatagramsInDrive) stats.maxDatagramsInDrive = transmits
             if (!endpoint.send(t, buf)) now = endpoint.now() // waited for the socket
 
             if (transmits >= MAX_TRANSMIT_DATAGRAMS) {
                 // As in quinn: if not all datagrams that could be sent are polled, the connection does not enter the
                 // app-limited state and its congestion window keeps growing until the next round (quinn#1126).
+                stats.transmitYields += 1
                 return true
             }
         }
@@ -639,6 +646,15 @@ internal class ConnectionState(
     suspend fun awaitStopped(id: StreamId) {
         val notify = stopped.get(id.value) ?: Notify().also { stopped.put(id.value, it) }
         notify.await()
+    }
+
+    /**
+     * A stream handle is closed: forget its waiter in [wakers], resuming it if it is still waiting. quinn only removes
+     * the waker, since a Rust stream cannot be dropped while one of its operations borrows it; a Kotlin handle can be
+     * closed while another coroutine waits on it, and that coroutine must see the stream closed rather than hang.
+     */
+    fun releaseWaiter(id: StreamId, wakers: LongMap<CancellableContinuation<Unit>>) {
+        wakeStream(id, wakers)
     }
 
     private fun wakeStream(id: StreamId, wakers: LongMap<CancellableContinuation<Unit>>) {

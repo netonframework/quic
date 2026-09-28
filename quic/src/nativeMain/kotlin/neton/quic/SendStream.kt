@@ -25,6 +25,8 @@ class SendStream internal constructor(
     val id: StreamId,
     private val is0rtt: Boolean,
 ) : AutoCloseable {
+    /** Whether a write is in progress (quinn's `&mut self` makes a second one impossible). */
+    private var writing = false
 
     /**
      * Write bytes `data[from, to)` to the stream (send_stream.rs:55). Yields the number of bytes written on success;
@@ -62,8 +64,22 @@ class SendStream internal constructor(
         }
     }
 
-    /** quinn `execute_poll`: run [writeFn], suspending while the stream is blocked. */
+    /**
+     * quinn `execute_poll`: run [writeFn], suspending while the stream is blocked. ⚖️ One write at a time: quinn's
+     * writes borrow the stream mutably; here a second concurrent write throws [IllegalStateException] (it would
+     * otherwise replace the first one's wake-up and leave it waiting forever).
+     */
     private suspend inline fun execute(writeFn: (ProtoSendStream) -> WriteResult): Written {
+        check(!writing) { "concurrent write on $this" }
+        writing = true
+        try {
+            return executeLoop(writeFn)
+        } finally {
+            writing = false
+        }
+    }
+
+    private suspend inline fun executeLoop(writeFn: (ProtoSendStream) -> WriteResult): Written {
         while (true) {
             if (is0rtt && !conn.check0rtt()) throw WriteError.ZeroRttRejected()
             conn.error?.let { throw WriteError.ConnectionLost(it) }
@@ -141,8 +157,8 @@ class SendStream internal constructor(
      * is gone or it already was finished or reset. Idempotent.
      */
     override fun close() {
-        // Clean up any previously registered wakers
-        conn.blockedWriters.remove(id.value)
+        // Clean up any previously registered wakers (a write still waiting is resumed and fails)
+        conn.releaseWaiter(id, conn.blockedWriters)
 
         if (conn.error != null || (is0rtt && !conn.check0rtt())) return
         try {
