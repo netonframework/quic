@@ -435,3 +435,12 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   - `EcnCodepoint`、`SocketAddress` 复用 neton-io。
 - §4 可行性的进展：openssl-kotlin 4.0.2 已提供 AEAD（AES-128/256-GCM、ChaCha20-Poly1305，原地）、头部保护掩码（AES / ChaCha20）、摘要、HMAC、HKDF（含 Expand-Label）、常量时间比较，覆盖 §4 第 2（Initial 部分）、3、4、10、11、12 项；
   第 1、2（阶段密钥导出）、5–9 项需要 OpenSSL 的第三方 QUIC TLS 接口（`SSL_set_quic_tls_cbs`、`SSL_set_quic_tls_transport_params`、`SSL_set_quic_tls_early_data_enabled`），已列为对 openssl-kotlin 的封装请求。
+
+### 11.2 步骤 2（部分）：加密层（2026-09-28）
+- 代码：`nativeMain` 的 `PacketProtection.kt`（三个 TLS 1.3 套件、Initial 密钥（v1 与 draft 的 salt）、包密钥与头部密钥、"quic ku" 密钥更新与预先计算的下一代、Retry 完整性标签与校验）、`TokenKeys.kt`（HMAC-SHA256 重置令牌密钥、HKDF-SHA256 → AES-256-GCM 令牌密钥），全部基于 openssl-kotlin 4.0.2；`Crypto.kt` 增加 `KeyPair`、`Keys`、`UnsupportedVersion`。
+- 目标平台随 openssl-kotlin 收窄：去掉 androidNativeArm32、androidNativeX86。
+- 测试：131 个全过。`headerEncoding` 与 `token.rs` 3 个改为参考原样（真实密钥、逐字节密文）；RFC 9001 附录 A.1–A.5 与 draft-29 向量、各套件密钥更新、限额、解密失败、HMAC（RFC 4231）、HKDF（RFC 5869）共 18 个；quinn `fuzz/` 的 packet、params、streamid 三个目标（各 2 万 / 10 万个带种子的输入）另加 frames，未发现缺陷；streams 目标待流状态机。
+- 与 quinn 的差异 ⚖️：openssl-kotlin 的句柄没有终结器，每个密钥登记 `Cleaner` 在回收时关闭（参考靠 drop）；附加数据需整个数组，头部复制进四个复用缓冲之一（稳定状态不分配）；ChaCha20 机密性上限取 `Long.MAX_VALUE`（参考 `u64::MAX`，都不可达）；Initial 套件固定为 TLS13_AES_128_GCM_SHA256；解密失败抛共享的 `CryptoError` 单例。
+- 热路径待测：openssl-kotlin 每次 seal / open / mask 内部 `usePinned`，可能每次调用分配一个小对象；以 callgrind 实测后再决定是否请求 openssl-kotlin 提供预先固定的接口。
+- `connection/packet_crypto.rs`（依赖包空间）随连接层移植。
+- 顺带修正：common 中的值类去掉 `@JvmInline`（本模块只有原生目标，共享元数据编译拒绝该可选期望注解），`compileCommonMainKotlinMetadata` 通过。
