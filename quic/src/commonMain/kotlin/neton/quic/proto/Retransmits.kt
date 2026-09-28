@@ -120,87 +120,10 @@ class ThinRetransmits {
 
     /** quinn's `Clone`. */
     fun copy(): ThinRetransmits = ThinRetransmits().also { it.retransmits = retransmits?.copy() }
-}
 
-/** Number of frames transmitted or received of each frame type (quinn-proto `connection/stats.rs:33`). */
-class FrameStats {
-    var acks: Long = 0
-    var ackFrequency: Long = 0
-    var crypto: Long = 0
-    var connectionClose: Long = 0
-    var dataBlocked: Long = 0
-    var datagram: Long = 0
+    /** Move the stored retransmits out, leaving this empty (quinn `mem::take`). */
+    internal fun take(): Retransmits? = retransmits.also { retransmits = null }
 
-    /** A `u8` in quinn, saturating at 255. */
-    var handshakeDone: Int = 0
-    var immediateAck: Long = 0
-    var maxData: Long = 0
-    var maxStreamData: Long = 0
-    var maxStreamsBidi: Long = 0
-    var maxStreamsUni: Long = 0
-    var newConnectionId: Long = 0
-    var newToken: Long = 0
-    var pathChallenge: Long = 0
-    var pathResponse: Long = 0
-    var ping: Long = 0
-    var resetStream: Long = 0
-    var retireConnectionId: Long = 0
-    var streamDataBlocked: Long = 0
-    var streamsBlockedBidi: Long = 0
-    var streamsBlockedUni: Long = 0
-    var stopSending: Long = 0
-    var stream: Long = 0
-
-    /** stats.rs:61 */
-    internal fun record(frame: Frame) {
-        when (frame) {
-            Frame.Padding -> {}
-            Frame.Ping -> ping += 1
-            is Frame.Ack -> acks += 1
-            is Frame.ResetStream -> resetStream += 1
-            is Frame.StopSending -> stopSending += 1
-            is Frame.Crypto -> crypto += 1
-            is Frame.Datagram -> datagram += 1
-            is Frame.NewToken -> newToken += 1
-            is Frame.MaxData -> maxData += 1
-            is Frame.MaxStreamData -> maxStreamData += 1
-            is Frame.MaxStreams -> if (frame.dir == Dir.Bi) maxStreamsBidi += 1 else maxStreamsUni += 1
-            is Frame.DataBlocked -> dataBlocked += 1
-            is Frame.Stream -> stream += 1
-            is Frame.StreamDataBlocked -> streamDataBlocked += 1
-            is Frame.StreamsBlocked -> if (frame.dir == Dir.Bi) streamsBlockedBidi += 1 else streamsBlockedUni += 1
-            is Frame.NewConnectionId -> newConnectionId += 1
-            is Frame.RetireConnectionId -> retireConnectionId += 1
-            is Frame.PathChallenge -> pathChallenge += 1
-            is Frame.PathResponse -> pathResponse += 1
-            is Frame.Close -> connectionClose += 1
-            is Frame.AckFrequency -> ackFrequency += 1
-            Frame.ImmediateAck -> immediateAck += 1
-            Frame.HandshakeDone -> handshakeDone = minOf(handshakeDone + 1, 255)
-        }
-    }
-
-    /** quinn's `Clone` / `Copy`. */
-    fun copy(): FrameStats = FrameStats().also {
-        it.acks = acks; it.ackFrequency = ackFrequency; it.crypto = crypto; it.connectionClose = connectionClose
-        it.dataBlocked = dataBlocked; it.datagram = datagram; it.handshakeDone = handshakeDone
-        it.immediateAck = immediateAck; it.maxData = maxData; it.maxStreamData = maxStreamData
-        it.maxStreamsBidi = maxStreamsBidi; it.maxStreamsUni = maxStreamsUni; it.newConnectionId = newConnectionId
-        it.newToken = newToken; it.pathChallenge = pathChallenge; it.pathResponse = pathResponse; it.ping = ping
-        it.resetStream = resetStream; it.retireConnectionId = retireConnectionId
-        it.streamDataBlocked = streamDataBlocked; it.streamsBlockedBidi = streamsBlockedBidi
-        it.streamsBlockedUni = streamsBlockedUni; it.stopSending = stopSending; it.stream = stream
-    }
-
-    /** quinn's `Debug`. */
-    override fun toString(): String =
-        "FrameStats { ACK: $acks, ACK_FREQUENCY: $ackFrequency, CONNECTION_CLOSE: $connectionClose, CRYPTO: $crypto, " +
-            "DATA_BLOCKED: $dataBlocked, DATAGRAM: $datagram, HANDSHAKE_DONE: $handshakeDone, " +
-            "IMMEDIATE_ACK: $immediateAck, MAX_DATA: $maxData, MAX_STREAM_DATA: $maxStreamData, " +
-            "MAX_STREAMS_BIDI: $maxStreamsBidi, MAX_STREAMS_UNI: $maxStreamsUni, " +
-            "NEW_CONNECTION_ID: $newConnectionId, NEW_TOKEN: $newToken, PATH_CHALLENGE: $pathChallenge, " +
-            "PATH_RESPONSE: $pathResponse, PING: $ping, RESET_STREAM: $resetStream, " +
-            "RETIRE_CONNECTION_ID: $retireConnectionId, STREAM_DATA_BLOCKED: $streamDataBlocked, " +
-            "STREAMS_BLOCKED_BIDI: $streamsBlockedBidi, STREAMS_BLOCKED_UNI: $streamsBlockedUni, " +
-            "STOP_SENDING: $stopSending, STREAM: $stream }"
+    /** Replace the stored retransmits (used when a sent packet's record is copied out of its space). */
+    internal fun set(value: Retransmits?) { retransmits = value }
 }

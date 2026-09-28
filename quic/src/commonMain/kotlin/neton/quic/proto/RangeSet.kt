@@ -193,8 +193,16 @@ class ArrayRangeSet private constructor(private val v: RangeVec) {
         return r
     }
 
+    /** Drop the lowest range ([popMin] without the `LongRange`). */
+    internal fun removeMin() {
+        if (v.n > 0) v.removeAt(0)
+    }
+
     fun min(): Long? = if (v.n == 0) null else v.starts[0]
     fun max(): Long? = if (v.n == 0) null else v.ends[v.n - 1] - 1
+
+    /** The largest element, or -1 when empty ([max] without boxing). */
+    internal fun maxOrNone(): Long = if (v.n == 0) -1 else v.ends[v.n - 1] - 1
 
     /** An independent copy. */
     fun copy(): ArrayRangeSet = ArrayRangeSet(v.copy())
