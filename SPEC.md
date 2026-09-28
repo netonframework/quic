@@ -470,6 +470,8 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 - 延后：qlog（§8）；`ServerConfig` / `ClientConfig`（需要 TLS 配置，§4）；由 `TransportConfig` 生成 `TransportParameters`（连接步骤）。
 
 ### 11.5 连接状态机与端点（2026-09-28，TLS 以测试替身代替）
+- **范围说明（2026-09-28 修订）**：完成的是 mock TLS 下的核心实现，**不是 QUIC 完工**。真实握手、证书验证、密钥切换（握手级别推进、1-RTT 更新）
+  与 quinn 的双向互通都未验证，可能暴露状态机问题；这些以真实 TLS 验收（§4、§10 第 7 步）为准。
 - 代码：`Connection`（`connection/mod.rs` 全部：握手状态、收包解密、帧处理、丢包检测与 PTO、拥塞 / pacing、ACK、密钥更新、0-RTT、迁移与路径验证、
   CID 管理、无状态重置、空闲超时、关闭 / draining、数据报、流、MTU / ECN / GSO、`pollTransmit` / `handleEvent` / `handleTimeout` / `poll`）、
   `Endpoint`（路由、建连、Retry 与令牌、版本协商、无状态重置、`accept` / `refuse` / `retry` / `ignore`）、`PacketBuilder`、`PacketCrypto`、
@@ -487,3 +489,39 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   `HashMap`、slab 复用最近释放的键；未处理的 `Incoming` 没有析构时的警告；配置为可变对象 + `copy()`。
 - 驱动层（§3，下一步）所需：每个数据报一个可保留的字节数组（原地解密、零复制交出流数据）；按 `Transmit` 发送（ECN、GSO `segmentSize`、源 IP）；
   事件在端点与连接之间转发；每连接一个单调截止时间（亚毫秒 pacing）；只在套接字保证不分片时开启 MTUD；真实 TLS 实现 `CryptoSession`。
+
+### 11.6 原生密钥的确定性释放（2026-09-28，评审 P1）
+- 问题：包保护、头部保护与令牌 AEAD 密钥的 OpenSSL 上下文此前只靠 `createCleaner` 在 GC 时关闭。这不等于 Rust 的 drop：连接关闭、旧密钥淘汰后原生
+  资源仍等待 GC，高连接周转或频繁密钥更新时原生内存无界。
+- 所有权：每个包空间独占其 `Keys`；1-RTT 头部密钥在密钥更新间由当前 `Keys` 持有（更新只替换包密钥）；`prevCrypto` 独占上一阶段的包密钥、
+  `nextCrypto` 独占预先计算的下一阶段包密钥；`zeroRttCrypto` 独占 0-RTT 密钥；`Incoming` 独占端点为首包派生的 Initial 密钥；令牌密钥单次使用。
+- 显式释放点：包空间丢弃（`discardSpace`，含 Retry 后重建 Initial）；密钥丢弃计时器（上一阶段与 0-RTT）；新的密钥更新替换仍保留的上一阶段；
+  客户端取得 1-RTT 后丢弃 0-RTT；连接进入 Drained（所有路径）时释放全部剩余密钥；端点的 Initial 密钥在 `accept` / `refuse` / `retry` / `ignore`
+  之后与 `handle` 的其他每个出口释放（`retry` 抛 `RetryError` 时保留，调用方仍可接受或拒绝）；令牌密钥用后即关。
+- 恰好一次：`NativeKeyResource` 以一次比较交换承载释放，显式 `close()` 与兜底的 cleaner 走同一路径，先到者释放、后到者无操作；
+  `HeaderKey` / `PacketKey` / `AeadKey` 为 `AutoCloseable`（幂等）。
+- 测试（`KeyLifecycleTest`，计数存活的原生上下文）：20 轮建连 + 交替发起的 3 次密钥更新 + 关闭排空后回到基线；10 轮 Retry 后拒绝回到基线；
+  显式关闭两次只减一次；不关闭时 cleaner 兜底释放。去掉排空时的释放，测试报告残留 32 个上下文。合计 437 个测试通过。
+
+### 11.7 对 openssl-kotlin 的请求（按批次，2026-09-28）
+职责边界：openssl-kotlin 提供 TLS 1.3 握手与密码原语；**传输参数的解释、CRYPTO 帧的重组与重传、连接调度仍归本库**。
+
+**第一批：QUIC TLS 握手接口（不混入 0-RTT）**
+- 能力：按加密级别（Initial / Handshake / 1-RTT）输入与输出 CRYPTO 字节；每个级别的读 / 写秘密（带套件）；ALPN；`quic_transport_parameters`
+  （0x39）原始字节双向；对端证书链与验证结果；TLS 告警（映射为 QUIC CRYPTO_ERROR 0x100 + alert）。
+- 必须同时规定的契约：
+  - 输入缓冲何时可复用；回调给出的数据能否被保留（还是只在回调期间有效）。
+  - 输出队列的上限、部分消费与背压（输出未取走时握手如何表现）。
+  - 回调中的异常不得穿过 C 边界；关闭引擎后不得留下悬空回调。
+  - 握手完成后仍能处理 TLS 消息（NewSessionTicket、KeyUpdate 以外的握手后消息）。
+  - 与 quinn 双向互通（本库客户端对 quinn 服务端、quinn 客户端对本库服务端），而不只是两个同实现端点互测。
+- 0-RTT（早期数据密钥、是否被接受、`max_early_data_size`）另作后续批次，单独验收。
+
+**第二批：现有 TLS 接口的正确性补齐（独立验证）**
+- 重试原因区分（WANT_READ / WANT_WRITE）、TLS KeyUpdate 接口、错误队列按连接隔离（含跨连接污染测试）。
+- TLS 的 KeyUpdate 与 QUIC 的包密钥更新（"quic ku"，本库自行派生）是不同接口、不同职责，不得合并。
+
+**第三批：预固定缓冲 / 原生指针热路径**
+- 先在当前构建中实测"每次调用 pin"的实际分配（pin 不必然等于堆分配），再分别比较安全数组接口与原生指针接口的每包指令数与分配数；
+  不得为省 pin 绕过密钥的独占访问与长度约束。
+
