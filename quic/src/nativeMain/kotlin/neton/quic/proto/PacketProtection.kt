@@ -221,9 +221,13 @@ internal fun headerKey(suite: CipherSuite, secret: ByteArray): HeaderKey {
  */
 internal class OpenSslPacketKey(suite: CipherSuite, key: ByteArray, private val iv: ByteArray) : PacketKey {
     private val aead = OpenSslAeadKey(suite.aead, key)
+    private val resource = NativeKeyResource(aead)
 
+    // Only a backstop: the connection closes its keys when it retires them.
     @Suppress("unused")
-    private val cleaner = createCleaner(aead) { it.close() }
+    private val cleaner = createCleaner(resource) { it.release() }
+
+    override fun close() = resource.release()
 
     private val nonce = ByteArray(NONCE_LEN)
     private val aadSlots = arrayOfNulls<ByteArray>(4)
@@ -284,9 +288,13 @@ internal class OpenSslPacketKey(suite: CipherSuite, key: ByteArray, private val 
  */
 internal class OpenSslHeaderKey(suite: CipherSuite, key: ByteArray) : HeaderProtection() {
     private val hp = OpenSslHeaderProtectionKey(suite.mask, key)
+    private val resource = NativeKeyResource(hp)
 
+    // Only a backstop: the connection closes its keys when it retires them.
     @Suppress("unused")
-    private val cleaner = createCleaner(hp) { it.close() }
+    private val cleaner = createCleaner(resource) { it.release() }
+
+    override fun close() = resource.release()
 
     override val sampleSize: Int get() = SAMPLE_LEN
 

@@ -82,9 +82,13 @@ class HkdfSha256TokenKey private constructor(private val prk: ByteArray) : Hands
  */
 internal class Aes256GcmZeroNonceKey(key: ByteArray) : AeadKey {
     private val aead = OpenSslAeadKey(AeadAlgorithm.AES_256_GCM, key)
+    private val resource = NativeKeyResource(aead)
 
+    // Only a backstop: token keys are single-use and closed by their caller.
     @Suppress("unused")
-    private val cleaner = createCleaner(aead) { it.close() }
+    private val cleaner = createCleaner(resource) { it.release() }
+
+    override fun close() = resource.release()
 
     override fun seal(data: ByteArray, additionalData: ByteArray): ByteArray {
         val out = data.copyOf(data.size + TAG_LEN)

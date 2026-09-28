@@ -317,6 +317,20 @@ class Endpoint(
             // This probably indicates that the user set supported_versions incorrectly in `EndpointConfig`.
             return null
         }
+        // ⚖️ The Initial keys go to the Incoming, or are freed here on every other outcome (quinn drops them).
+        val outcome = try {
+            handleFirstPacketWithKeys(event, addresses, header, firstDecode, dstCid, serverConfig, crypto, buf)
+        } catch (e: Throwable) {
+            crypto.close(); throw e
+        }
+        if (outcome !is DatagramEvent.NewConnection) crypto.close()
+        return outcome
+    }
+
+    private fun handleFirstPacketWithKeys(
+        event: ConnectionEvent.Datagram, addresses: FourTuple, header: ProtectedHeader.Initial, firstDecode: PartialDecode,
+        dstCid: ConnectionId, serverConfig: ServerConfig, crypto: Keys, buf: Buffer,
+    ): DatagramEvent? {
 
         earlyValidateFirstPacket(header)?.let { reason ->
             return DatagramEvent.Response(initialClose(header.version, addresses, crypto, header.srcCid, reason, buf))
@@ -365,7 +379,10 @@ class Endpoint(
      * Attempt to accept this incoming connection (an error may still occur; endpoint.rs:549). Uses [serverConfig] if
      * given, else the configuration the attempt arrived with. Throws [AcceptError].
      */
-    fun accept(incoming: Incoming, now: Instant, buf: Buffer, serverConfig: ServerConfig? = null): Pair<ConnectionHandle, Connection> {
+    fun accept(incoming: Incoming, now: Instant, buf: Buffer, serverConfig: ServerConfig? = null): Pair<ConnectionHandle, Connection> =
+        try { acceptInner(incoming, now, buf, serverConfig) } finally { incoming.releaseKeys() }
+
+    private fun acceptInner(incoming: Incoming, now: Instant, buf: Buffer, serverConfig: ServerConfig?): Pair<ConnectionHandle, Connection> {
         val remoteAddressValidated = incoming.remoteAddressValidated()
         incoming.consume()
         val incomingBuffer = incomingBuffers.remove(incoming.incomingIdx)
@@ -480,7 +497,10 @@ class Endpoint(
     }
 
     /** Reject this incoming connection attempt (endpoint.rs:727). */
-    fun refuse(incoming: Incoming, buf: Buffer): Transmit {
+    fun refuse(incoming: Incoming, buf: Buffer): Transmit =
+        try { refuseInner(incoming, buf) } finally { incoming.releaseKeys() }
+
+    private fun refuseInner(incoming: Incoming, buf: Buffer): Transmit {
         cleanUpIncoming(incoming)
         incoming.consume()
 
@@ -492,7 +512,10 @@ class Endpoint(
      * Respond with a retry packet, requiring the client to retry with address validation (endpoint.rs:744). Throws
      * [RetryError] if [Incoming.mayRetry] is false.
      */
-    fun retry(incoming: Incoming, buf: Buffer): Transmit {
+    fun retry(incoming: Incoming, buf: Buffer): Transmit =
+        retryInner(incoming, buf).also { incoming.releaseKeys() }   // a RetryError leaves the Incoming (and its keys) usable
+
+    private fun retryInner(incoming: Incoming, buf: Buffer): Transmit {
         if (!incoming.mayRetry()) throw RetryError(incoming)
 
         val serverConfig = incomingBuffers[incoming.incomingIdx].serverConfig
@@ -525,7 +548,10 @@ class Endpoint(
      * actively, rather than merely dropping the [Incoming], is necessary to prevent memory leaks due to state within
      * the endpoint tracking the incoming connection.
      */
-    fun ignore(incoming: Incoming) {
+    fun ignore(incoming: Incoming) =
+        try { ignoreInner(incoming) } finally { incoming.releaseKeys() }
+
+    private fun ignoreInner(incoming: Incoming) {
         cleanUpIncoming(incoming)
         incoming.consume()
     }
@@ -822,6 +848,15 @@ class Incoming internal constructor(
     internal val incomingIdx: Int,
 ) {
     private var consumed = false
+
+    private var keysReleased = false
+
+    /** ⚖️ Free the Initial keys once the attempt is accepted, refused, retried or ignored. */
+    internal fun releaseKeys() {
+        if (keysReleased) return
+        keysReleased = true
+        crypto.close()
+    }
 
     internal fun consume() {
         check(!consumed) { "this Incoming was already accepted, refused, retried or ignored" }

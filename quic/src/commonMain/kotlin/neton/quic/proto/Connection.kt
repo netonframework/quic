@@ -775,13 +775,16 @@ class Connection internal constructor(
             when (timer) {
                 Timer.Close -> {
                     state = State.Drained
-                    endpointEvents.addLast(EndpointEvent.Drained)
+                    releaseKeys()
+            endpointEvents.addLast(EndpointEvent.Drained)
                 }
                 Timer.Idle -> kill(ConnectionError.TimedOut)
                 Timer.KeepAlive -> ping()
                 Timer.LossDetection -> onLossDetectionTimeout(now)
                 Timer.KeyDiscard -> {
+                    zeroRttCrypto?.close()
                     zeroRttCrypto = null
+                    prevCrypto?.crypto?.close()
                     prevCrypto = null
                 }
                 Timer.PathValidation -> {
@@ -1431,6 +1434,7 @@ class Connection internal constructor(
         }
         // 0-RTT enabled
         zeroRttEnabled = true
+        zeroRttCrypto?.close()
         zeroRttCrypto = ZeroRttCrypto(early.header, early.packet)
     }
 
@@ -1512,6 +1516,7 @@ class Connection internal constructor(
         highestSpace = space
         if (space == SpaceId.Data && side.isClient) {
             // Discard 0-RTT keys because 1-RTT keys are available.
+            zeroRttCrypto?.close()
             zeroRttCrypto = null
         }
     }
@@ -1523,6 +1528,7 @@ class Connection internal constructor(
             (side as? ConnectionSide.Client)?.token = Bytes.EMPTY
         }
         val space = spaces[spaceId]
+        space.crypto?.close()                   // ⚖️ quinn drops them; the native contexts are freed now
         space.crypto = null
         space.timeOfLastAckElicitingPacket = Instant.NONE
         space.lossTime = Instant.NONE
@@ -1672,6 +1678,7 @@ class Connection internal constructor(
             if (!state.isDrained) setCloseTimer(now)
         }
         if (!wasDrained && state.isDrained) {
+            releaseKeys()
             endpointEvents.addLast(EndpointEvent.Drained)
             // Close timer may have been started previously, e.g. if we sent a close and got a stateless reset in
             // response
@@ -2459,6 +2466,7 @@ class Connection internal constructor(
         spaces[SpaceId.Data].crypto = Keys(current.header, nextCrypto!!)
         nextCrypto = new
         spaces[SpaceId.Data].sentWithKeys = 0
+        prevCrypto?.crypto?.close()           // an earlier phase still retained: its keys are retired now
         prevCrypto = PrevCrypto(old, endPacket, endPacketTime, remote)
         keyPhase = !keyPhase
     }
@@ -2568,12 +2576,27 @@ class Connection internal constructor(
         prevPath?.removeInFlight(packet)
     }
 
+    /**
+     * ⚖️ Free every key the connection still holds when it drains (quinn drops them with the connection). The 1-RTT
+     * header keys are shared by the current and the retired packet keys, so each key is closed once through its owner.
+     */
+    private fun releaseKeys() {
+        for (space in spaces) {
+            space.crypto?.close()
+            space.crypto = null
+        }
+        nextCrypto?.close(); nextCrypto = null
+        prevCrypto?.crypto?.close(); prevCrypto = null
+        zeroRttCrypto?.close(); zeroRttCrypto = null
+    }
+
     /** Terminate the connection instantly, without sending a close packet. */
     internal fun kill(reason: ConnectionError) {
         closeCommon()
         error = reason
         state = State.Drained
-        endpointEvents.addLast(EndpointEvent.Drained)
+        releaseKeys()
+            endpointEvents.addLast(EndpointEvent.Drained)
     }
 
     /**

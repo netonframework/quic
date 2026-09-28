@@ -134,7 +134,7 @@ class Token(val payload: TokenPayload, val nonce: U128) {
             }
         }
         val nonceBytes = nonce.toLeBytes()
-        val sealed = key.aeadFromHkdf(nonceBytes).seal(buf.readAll(), ByteArray(0))
+        val sealed = key.aeadFromHkdf(nonceBytes).use { it.seal(buf.readAll(), ByteArray(0)) }
         return sealed + nonceBytes
     }
 
@@ -149,7 +149,7 @@ class Token(val payload: TokenPayload, val nonce: U128) {
             val nonceBytes = raw.copyOfRange(nonceStart, raw.size)
             val nonce = U128.fromLeBytes(nonceBytes)
             val data = try {
-                key.aeadFromHkdf(nonceBytes).open(raw.copyOfRange(0, nonceStart), ByteArray(0))
+                key.aeadFromHkdf(nonceBytes).use { it.open(raw.copyOfRange(0, nonceStart), ByteArray(0)) }
             } catch (e: CryptoError) {
                 return null
             }

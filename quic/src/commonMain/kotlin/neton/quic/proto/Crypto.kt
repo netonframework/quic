@@ -13,12 +13,15 @@ class CryptoError(message: String = "crypto error") : Exception(message)
 class UnsupportedVersion(val version: Int) : Exception("unsupported QUIC version 0x${version.toUInt().toString(16)}")
 
 /** A pair of keys for bidirectional communication (quinn `crypto::KeyPair`, crypto.rs:97). */
-class KeyPair<T>(
+class KeyPair<T : AutoCloseable>(
     /** Key for encrypting data. */
     val local: T,
     /** Key for decrypting data. */
     val remote: T,
-)
+) {
+    /** Release both keys (each exactly once; see [HeaderKey.close]). */
+    fun close() { local.close(); remote.close() }
+}
 
 /** A complete set of keys for a certain packet space (quinn `crypto::Keys`, crypto.rs:105). */
 class Keys(
@@ -26,7 +29,10 @@ class Keys(
     val header: KeyPair<HeaderKey>,
     /** Packet protection keys. */
     val packet: KeyPair<PacketKey>,
-)
+) {
+    /** Release all four keys. Only for keys this set owns alone: 1-RTT header keys outlive a key update. */
+    fun close() { header.close(); packet.close() }
+}
 
 /**
  * Keys used to protect packet headers (quinn `crypto::HeaderKey`, crypto.rs:168; RFC 9001 §5.4).
@@ -34,7 +40,14 @@ class Keys(
  * Packet regions are `packet[start, end)`; [pnOffset] is relative to `start`, as in quinn where the slice
  * starts at the packet's first byte.
  */
-interface HeaderKey {
+/**
+ * Keys own native cipher contexts. ⚖️ quinn frees them on drop; here the owner calls [close] when the key is retired
+ * (a packet space discarded, a key phase ended, the connection drained). Closing is idempotent; a GC cleaner only
+ * backs it up and never releases twice.
+ */
+interface HeaderKey : AutoCloseable {
+    override fun close() {}
+
     /** Remove header protection in place. */
     fun decrypt(pnOffset: Int, packet: ByteArray, start: Int, end: Int)
 
@@ -46,7 +59,10 @@ interface HeaderKey {
 }
 
 /** Keys used to protect packet payloads (quinn `crypto::PacketKey`, crypto.rs:148; RFC 9001 §5.3). */
-interface PacketKey {
+interface PacketKey : AutoCloseable {
+    /** Release the native context (idempotent); see [HeaderKey]. */
+    override fun close() {}
+
     /**
      * Encrypt `packet[start + headerLen, end - tagLen)` in place with the header `packet[start, start + headerLen)`
      * as associated data, writing the tag into the last [tagLen] bytes.
@@ -88,7 +104,10 @@ interface HandshakeTokenKey {
 }
 
 /** A key for sealing data with AEAD-based algorithms (quinn `crypto::AeadKey`, crypto.rs:200). */
-interface AeadKey {
+/** A single-use token key: close it after the operation (idempotent). */
+interface AeadKey : AutoCloseable {
+    override fun close() {}
+
     /** Seal [data] and return ciphertext followed by the tag. */
     fun seal(data: ByteArray, additionalData: ByteArray): ByteArray
 

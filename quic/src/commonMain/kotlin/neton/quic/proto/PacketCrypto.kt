@@ -42,7 +42,9 @@ internal class PrevCrypto(
 )
 
 /** packet_crypto.rs:165 */
-internal class ZeroRttCrypto(val header: HeaderKey, val packet: PacketKey)
+internal class ZeroRttCrypto(val header: HeaderKey, val packet: PacketKey) {
+    fun close() { header.close(); packet.close() }
+}
 
 /**
  * Decrypts a packet's body in place (packet_crypto.rs:74). Returns the full packet number, [NO_PACKET_NUMBER] for
