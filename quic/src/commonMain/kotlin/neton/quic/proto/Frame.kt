@@ -3,12 +3,10 @@ package neton.quic.proto
 import neton.io.bytes.Buffer
 import neton.io.bytes.Bytes
 import neton.io.net.EcnCodepoint
-import kotlin.jvm.JvmInline
 
 // QUIC frames (quinn-proto `frame.rs`; RFC 9000 §19, RFC 9221 DATAGRAM, draft-ietf-quic-ack-frequency).
 
 /** A QUIC frame type (frame.rs:23). */
-@JvmInline
 value class FrameType(val value: Long) {
 
     fun encode(buf: Buffer) = buf.writeVar(value)

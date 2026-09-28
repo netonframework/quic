@@ -1,12 +1,10 @@
 package neton.quic.proto
 
 import neton.io.bytes.Buffer
-import kotlin.jvm.JvmInline
 
 /**
  * Transport-level error code (quinn `transport_error::Code`, transport_error.rs:46; RFC 9000 §20.1).
  */
-@JvmInline
 value class TransportErrorCode(val value: Long) {
 
     fun encode(buf: Buffer) = buf.writeVar(value)

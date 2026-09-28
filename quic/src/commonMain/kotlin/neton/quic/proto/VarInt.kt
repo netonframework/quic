@@ -1,6 +1,5 @@
 package neton.quic.proto
 
-import kotlin.jvm.JvmInline
 
 /**
  * An integer less than 2^62, suitable for encoding as a QUIC variable-length integer
@@ -11,7 +10,6 @@ import kotlin.jvm.JvmInline
  * The primary constructor does not check the bound (quinn's `from_u64_unchecked`); use [fromLong]
  * or [fromLongOrNull] for untrusted values.
  */
-@JvmInline
 value class VarInt(val value: Long) : Comparable<VarInt> {
 
     /** Number of bytes needed to encode this value (quinn `VarInt::size`, varint.rs:55). */

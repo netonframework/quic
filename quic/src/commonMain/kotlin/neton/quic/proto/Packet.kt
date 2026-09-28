@@ -2,7 +2,6 @@ package neton.quic.proto
 
 import neton.io.bytes.Buffer
 import neton.io.bytes.Bytes
-import kotlin.jvm.JvmInline
 
 // QUIC packet headers (quinn-proto `packet.rs`; RFC 9000 §17, RFC 8999 invariants, RFC 9287 GREASE bit).
 //
@@ -70,7 +69,6 @@ sealed class PacketDecodeError(message: String) : Exception(message) {
  * An encoded (truncated) packet number of 1-4 bytes (packet.rs:682): `U8`, `U16`, `U24` or `U32`.
  * Packed into one Long (value in the low 32 bits, length above) so it never allocates.
  */
-@JvmInline
 value class PacketNumber private constructor(private val raw: Long) {
 
     /** Encoded length in bytes, 1..4. */
