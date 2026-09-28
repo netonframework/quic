@@ -104,16 +104,19 @@ data class EcnCounts(var ect0: Long = 0, var ect1: Long = 0, var ce: Long = 0) {
 data class StreamMeta(val id: StreamId = StreamId(0), val start: Long = 0, val end: Long = 0, val fin: Boolean = false) {
 
     /** Write the STREAM frame header; the caller appends `end - start` bytes of data (frame.rs:486). */
-    fun encode(length: Boolean, out: Buffer) {
-        var ty = FrameType.STREAM_TYS_START
-        if (start != 0L) ty = ty or 0x04
-        if (length) ty = ty or 0x02
-        if (fin) ty = ty or 0x01
-        out.writeVar(ty)             // 1 byte
-        out.writeVar(id.value)       // <= 8 bytes
-        if (start != 0L) out.writeVar(start) // <= 8 bytes
-        if (length) out.writeVar(end - start) // <= 8 bytes
-    }
+    fun encode(length: Boolean, out: Buffer) = encodeStreamHeader(id, start, end, fin, length, out)
+}
+
+/** [StreamMeta.encode] without a `StreamMeta` object, for the send path (one STREAM frame header per call). */
+internal fun encodeStreamHeader(id: StreamId, start: Long, end: Long, fin: Boolean, length: Boolean, out: Buffer) {
+    var ty = FrameType.STREAM_TYS_START
+    if (start != 0L) ty = ty or 0x04
+    if (length) ty = ty or 0x02
+    if (fin) ty = ty or 0x01
+    out.writeVar(ty)             // 1 byte
+    out.writeVar(id.value)       // <= 8 bytes
+    if (start != 0L) out.writeVar(start) // <= 8 bytes
+    if (length) out.writeVar(end - start) // <= 8 bytes
 }
 
 /** A QUIC frame (frame.rs:143). */

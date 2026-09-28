@@ -218,7 +218,7 @@ class ArrayRangeSet private constructor(private val v: RangeVec) {
  * A set of values optimized for long runs and random insert/delete/contains (quinn `RangeSet`,
  * range_set/btree_range_set.rs), with binary search over sorted range arrays (see the file comment).
  */
-class RangeSet private constructor(private val v: RangeVec) {
+class RangeSet private constructor(internal val v: RangeVec) {
 
     constructor() : this(RangeVec(4))
 
@@ -237,7 +237,7 @@ class RangeSet private constructor(private val v: RangeVec) {
     }
 
     /** Index of the last range starting at or before [x], or -1 (quinn `pred`). */
-    private fun pred(x: Long): Int {
+    internal fun pred(x: Long): Int {
         var lo = 0
         var hi = v.n
         while (lo < hi) {
@@ -316,6 +316,15 @@ class RangeSet private constructor(private val v: RangeVec) {
 
     fun replace(start: Long, end: Long): List<LongRange> {
         val out = ArrayList<LongRange>(2)
+        replaceEach(start, end) { s, e -> out.add(s until e) }
+        return out
+    }
+
+    /**
+     * [replace] without the list: [onReplaced] receives each previously present sub-range `[s, e)` of `[start, end)`,
+     * in ascending order, while the set is being updated (it must not touch this set). Allocates nothing.
+     */
+    internal inline fun replaceEach(start: Long, end: Long, onReplaced: (Long, Long) -> Unit) {
         val v = v
         var rs = start
         var re = end
@@ -327,9 +336,9 @@ class RangeSet private constructor(private val v: RangeVec) {
             val replacedEnd = minOf(re, prevEnd)
             rs = minOf(rs, prevStart)
             re = maxOf(re, prevEnd)
-            if (start != replacedEnd) out.add(start until replacedEnd)
+            if (start != replacedEnd) onReplaced(start, replacedEnd)
         }
-        if (re <= rs) return out // empty range: nothing inserted (quinn's Drop returns early)
+        if (re <= rs) return // empty range: nothing inserted (quinn's Drop returns early)
         while (true) {
             val j = pred(rs) + 1
             if (j >= v.n) break
@@ -340,7 +349,7 @@ class RangeSet private constructor(private val v: RangeVec) {
             val replacedEnd = minOf(re, nextEnd)
             re = maxOf(re, nextEnd)
             if (nextStart == replacedEnd) break
-            out.add(nextStart until replacedEnd)
+            onReplaced(nextStart, replacedEnd)
         }
         // Drain any remaining overlaps (quinn's `Drop` loops until the iterator ends), then insert the union.
         while (true) {
@@ -352,7 +361,6 @@ class RangeSet private constructor(private val v: RangeVec) {
             v.removeAt(j)
         }
         v.insertAt(pred(rs) + 1, rs, re)
-        return out
     }
 
     fun add(other: RangeSet) {
@@ -372,6 +380,11 @@ class RangeSet private constructor(private val v: RangeVec) {
         val r = peekMin() ?: return null
         v.removeAt(0)
         return r
+    }
+
+    /** Drop the lowest range; read it first with `startAt(0)` / `endAt(0)` ([popMin] without the `LongRange`). */
+    internal fun removeMin() {
+        if (v.n > 0) v.removeAt(0)
     }
 
     fun copy(): RangeSet = RangeSet(v.copy())
