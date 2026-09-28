@@ -444,3 +444,10 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 - 热路径待测：openssl-kotlin 每次 seal / open / mask 内部 `usePinned`，可能每次调用分配一个小对象；以 callgrind 实测后再决定是否请求 openssl-kotlin 提供预先固定的接口。
 - `connection/packet_crypto.rs`（依赖包空间）随连接层移植。
 - 顺带修正：common 中的值类去掉 `@JvmInline`（本模块只有原生目标，共享元数据编译拒绝该可选期望注解），`compileCommonMainKotlinMetadata` 通过。
+
+### 11.3 步骤 3：流、流量控制、数据报（2026-09-28）
+- 代码（`neton.quic.proto`）：`Assembler`、`SendBuffer`、`StreamsSend`、`StreamsRecv`、`StreamsState`、`Streams`（`SendStream` / `RecvStream` / `Chunks` / 事件与错误类型）、`Retransmits`（含 `ThinRetransmits`、`FrameStats`、`StreamReset`）、`Datagrams`、`CidQueue`、`CidState`、`Collections`（`LongMap` / `LongHashSet` / `LongList`）、`Instant`；`Frame.kt` 增加不创建 `StreamMeta` 的 `encodeStreamHeader`，`RangeSet` 增加 `removeMin` 与无分配的 `replaceEach`。
+- 测试：229 个（此前 131 + 98）全过；linuxX64、mingwX64、androidNativeArm32 编译通过。assembler 26、send_buffer 7、streams/send 2、streams/recv 1、streams/state 24、datagrams 5、cid_queue 11 全部移植；另加：assembler 的堆对照有序列表模型与随机重组、控制帧经 `FrameIter` 解回、`maxSize` 上限、跨多次写出带 FIN 的 STREAM 帧与重传、替代数据结构对照参考模型、数据报收发路径。
+- 保留的 quinn 行为：`Chunks` 在检查读取顺序前从映射中取出流状态，非法有序读时该状态被丢弃且不计为释放；部分有序读后改为无序读可能重复交付已读字节（`defragment` 从偏移 0 而不是读位置裁剪），有测试固定该行为。
+- ⚖️：`FxHashMap` / `FxHashSet` / `Vec<u64>` 改为基于 `LongArray` 的 `LongMap` / `LongHashSet` / `LongList`（键不装箱，迭代顺序同样未指定）；`BinaryHeap<Buffer>` 改为平行数组的 `ChunkHeap`（逐步照搬 Rust 的 sift / pop / sort，相等块的出队顺序相同）；发送队列的优先级堆用平行数组，最近度按无符号比较；发送缓冲保留首段整体、以 `frontTrimmed` 标记起点；为避免每帧分配，元组返回值拆开（`Recv.ingest` 只返回新字节数，`Recv.stop` 只返回额度，`maxStreamData` + `maxStreamDataShouldTransmit`，`BytesSource` 累加 `chunksConsumed`）；`RecvState` 展平为字段（-1 表示最终大小未知）；会阻塞的结果以密封类返回而非抛出（K/N 抛异常代价为微秒级），误用类错误抛出；`Chunks` 必须显式结束（无析构）；句柄接收 `connClosed` 而不借用连接状态；数据报每个开销固定 32 字节；`StreamEvent` / `Chunk` / `CidQueue.Retired` / `Next` / `StreamReset` 为小对象（已打开流上每个入站 STREAM 帧一个 `StreamEvent.Readable`）；`debug_assert!` 以注释保留（同参考的发布版行为）。
+- 向 neton-io 提出：`Bytes` 的区间复制（`copyInto(dst, dstOffset, from, to)`），可省去把存储的写入部分装进包时每个 STREAM 帧一个的小切片对象。
