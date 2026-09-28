@@ -1,7 +1,6 @@
 package neton.quic.proto
 
 import neton.io.bytes.Bytes
-import kotlin.jvm.JvmInline
 
 // Application-facing stream handles and stream events (quinn-proto `connection/streams/mod.rs`).
 //
@@ -395,7 +394,6 @@ sealed class StreamEvent {
 }
 
 /** Indicates whether a frame needs to be transmitted (mod.rs:525). */
-@JvmInline
 value class ShouldTransmit(
     /** Whether a frame should be transmitted. */
     val shouldTransmit: Boolean,
