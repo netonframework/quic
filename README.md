@@ -9,7 +9,7 @@ Specification and implementation record: [SPEC.md](SPEC.md).
 
 The protocol core runs against a **test double for TLS**. QUIC is not complete, and nothing here is fit for use yet.
 
-What exists (SPEC §11.1–11.6):
+What exists (SPEC §11.1–11.6, §11.8):
 - varint and frame codecs, and packet protection and header protection on openssl-kotlin primitives;
 - streams, flow control and datagrams;
 - congestion control (NewReno, Cubic, BBR), pacing, RTT estimation, MTU discovery, packet spaces and ACKs;
@@ -17,7 +17,10 @@ What exists (SPEC §11.1–11.6):
   negotiation, stateless reset);
 - deterministic release of native key contexts: explicit ownership and release points, and an exactly-once release
   shared with the GC cleaner, which is only a backstop;
-- quinn's connection and token tests, run against the test double; 437 tests in all.
+- quinn's connection and token tests, run against the test double;
+- the driver layer (SPEC §3, §11.8): the endpoint, connection and stream API on neton-io UDP sockets on one reactor,
+  with receive and send budgets, the lifecycle rules as explicit `close()`, streams as neton-io `IoStream`, and a
+  fairness test; quinn's `tests.rs` run over loopback UDP, still on the TLS test double. 490 tests in all.
 
 What is missing, and blocks the first version:
 - **Real TLS.** The handshake, certificate verification, advancing key levels and 1-RTT key updates on a real TLS
@@ -26,7 +29,6 @@ What is missing, and blocks the first version:
     been delivered yet.
   - Interpreting transport parameters, reassembling and retransmitting CRYPTO data, and scheduling connections stay
     in this library.
-- **The driver layer (SPEC §3):** sockets, timers, and the endpoint and connection tasks on neton-io datagrams.
 - **0-RTT on real TLS.** It is a separate later batch with its own acceptance.
 
 ## Building and testing

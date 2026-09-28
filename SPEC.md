@@ -525,3 +525,89 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 - 先在当前构建中实测"每次调用 pin"的实际分配（pin 不必然等于堆分配），再分别比较安全数组接口与原生指针接口的每包指令数与分配数；
   不得为省 pin 绕过密钥的独占访问与长度约束。
 
+### 11.8 驱动层（quinn 的 `quinn` crate，2026-09-29，TLS 仍为测试替身）
+- **范围说明**：完成的是 §3 的协程驱动与 API，运行在真实的回环 UDP 套接字上，但握手用的仍是 `MockTls`（只在 `nativeTest`）。真实 TLS 未接入
+  （§4、§11.7 第一批未交付），证书、ALPN、0-RTT、密钥更新在真实 TLS 上都未验收，与 quinn 的互通未做；**QUIC 没有完成**。
+- 代码（`nativeMain`，包 `neton.quic`）：`Endpoint`（含 `DriverConfig`、`EndpointStats`）、`Connection`（`Connecting`、`ZeroRttAccepted`、
+  每连接的驱动协程 `ConnectionState`）、`Incoming`、`SendStream`、`RecvStream`、`QuicStream`（IoStream 适配）、`Errors`、`Notify`；`commonMain`
+  的 `WorkLimiter`（quinn `work_limiter.rs`）。此前的 WIP 提交未经评审，本节为评审与补齐的记录。
+- **评审结论（对照 §3 与 quinn 源码逐项核对）**：
+  - 核对无误：单反应器——端点、它的 UDP 套接字与全部连接都在创建端点的反应器上，端点的协程是创建者的子协程；接收循环把数据报的
+    `ConnectionEvent` 直接放入连接的队列并唤醒其驱动，连接驱动直接调用协议端点处理 `EndpointEvent`，没有通道、没有状态锁。唯一的挂起原语
+    `sendLock` 是套接字写满时各连接排队的 FIFO（neton-io 每个 UDP 套接字只允许一个挂起的 `send`），只在反应器线程上使用，不是跨线程锁。
+    背压：写在流量控制阻塞时挂起、由 Writable 恢复，读同理。轮转：用完预算的驱动 `yield`，neton-io 反应器的 `dispatch` 把它排到普通任务队列末尾，
+    有剩余工作的驱动按 FIFO 轮流执行。§3 API 表的六个类型逐项齐全，无缺项。quinn `tests.rs` 的 21 个测试全部移植（`DriverTest`，3 个压力测试
+    与参考一样 `@Ignore`），`many_connections` 移植并随套件运行（参考为 `#[ignore]`），`post_quantum` 取决于 TLS。
+  - 发现并修正（每项附原因）：
+    1. **接收预算只有时间片**：WIP 只用 quinn 的 `WorkLimiter`（50 µs），没有 §3 的条数上限。增加 `DriverConfig`：`maxDatagramsPerTurn`
+       （默认 32 × 5）与 `recvTimeBudget`（默认 50 µs，经 `WorkLimiter`），先到为准；条数按条精确截断，批内未处理的消息留到下一轮最先处理
+       （Linux 一批 32 条，上限 8 时一轮在批中间结束，测试覆盖）；用完后 `yield` 排到任务队列末尾。
+    2. **发送预算可超出**：quinn 每次 `poll_transmit` 都请求 `max_datagrams` 个分段，一次驱动最多可发 29 个数据报（quinn 同样如此）。改为请求
+       min(10, 20 − 本次已发) ⚖️，一次驱动严格不超过 20 个。
+    3. **rebind 与阻塞发送**：挂起在旧套接字上的发送，在新套接字收到流量、旧套接字被关闭时抛 `ClosedException`，连接随之以 INTERNAL_ERROR
+       终止。改为在新套接字上重试（quinn 的连接收到 `Rebind` 后换套接字重发缓存的 transmit）。
+    4. **同方向并发操作使前一个永远挂起**：两个协程同时读一个 `RecvStream`（或读与 `receivedReset` 同时进行）时，后者覆盖前者登记在
+       `blockedReaders` 中的续体，前者再也不会被唤醒；写同理。quinn 的 `&mut self` 使这种情况不可能出现。改为第二个操作抛
+       `IllegalStateException`（与 neton-io §28.6 的并发规则一致）。
+    5. **关闭流时丢弃等待者**：`close` / `stop` 从表中移除等待的续体但不恢复它，另一个协程中挂起的读写永远挂起（quinn 中流被借用时不能被
+       drop）。改为恢复它：读看到流已停止（返回 -1，同 quinn 在 `stop` 之后的读），写得到 `WriteError.ClosedStream`。
+    6. **未处置的 `Connecting` 泄漏连接**：quinn 丢弃未完成的 `Connecting` 即丢弃最后一个句柄，连接以 0 关闭；WIP 中它没有关闭手段，连接要等空闲
+       超时。`Connecting` 改为 `AutoCloseable`。
+    7. **端点关闭时持有的 `Incoming` 拒绝得太晚**：WIP 只在端点最终停止（所有连接排空之后）时拒绝，端点仍有连接时对端要等到超时。改为
+       `Endpoint.close()` 时立即拒绝；此后 `accept` 返回 `null`，新到的连接尝试被拒绝。
+  - ⚖️ 轮次的界定：quinn 每次驱动被唤醒都开始新的 `WorkLimiter` 周期。协程无法在不分配的情况下判断 `UdpSocket.recv` 是否挂起过（neton-io 没有
+    不挂起的 `tryRecv`），因此本库的一轮从一次 `yield` 到下一次，`recv` 中途挂起不开始新的一轮，挂起的时间不计入时间片。预算因此是每次唤醒
+    工作量的上限；跨越挂起的一轮只会比 quinn 更早让出。
+  - ⚖️ 计时器：连接的计时器用反应器的 `Delay.invokeOnTimeout`，精度为毫秒，截止时间向上取整（不早触发），到期判断以时钟为准（同 quinn）。
+    pacing 所需的亚毫秒计时仍待 §9 的计时审计。
+  - ⚖️ 流不保持连接：quinn 的流也持有连接的引用计数，最后一个句柄（含流）丢弃时连接才关闭；本库 `Connection.close()` 即关闭，读完的流可以不关闭，
+    否则引用计数永远归不了零。
+- **生命周期（§3，每条规则一个测试，`LifecycleTest` 13 个）**：显式 `close()`（`AutoCloseable`）承载 quinn 的 drop 规则，`use { }` 使取消也执行它们。
+
+  | 规则 | 测试 |
+  |---|---|
+  | `SendStream.close()` = finish | `sendStreamCloseFinishes`（对端读到数据后 EOF，未发 RESET_STREAM）；`sendStreamUseFinishesOnCancellation`（`use` 中被取消） |
+  | 已被对端 stop 的 `SendStream.close()` = 以对端的码 reset | `sendStreamCloseAfterStopResets`（STOP_SENDING(7) 后关闭，发出 RESET_STREAM） |
+  | 未读完的 `RecvStream.close()` = stop(0) | `recvStreamCloseBeforeEndStops`（对端 `stopped()` 得到 0）；反例 `recvStreamCloseAfterEndDoesNotStop` |
+  | `Connection.close()` = 以 0 关闭 | `connectionCloseUsesCode0`（对端得到 ApplicationClosed(0, "")）；`connectionUseClosesOnCancellation`；反例 `connectionCloseKeepsAnEarlierReason` |
+  | 未交出连接的 `Connecting.close()` = 以 0 关闭 | `connectingCloseClosesConnection`（握手中的应用关闭按 RFC 9000 §10.2.3 以 APPLICATION_ERROR 送达，客户端端点随后空闲） |
+  | `Incoming.close()` = refuse | `incomingCloseRefuses`（CONNECTION_REFUSED） |
+  | 端点关闭时未处置的 `Incoming` 被拒绝 | `incomingHeldIsRefusedWhenEndpointCloses`；`incomingHeldIsRefusedWhenEndpointClosesWithLiveConnections`（去掉修正 7 即超时失败）；`endpointRefusesNewAttemptsOnceClosed` |
+
+  - 从未交给 `accept` 的排队尝试在端点停止时忽略（同 quinn `State::drop`）。未覆盖：端点所在的作用域被**取消**时，连接驱动随之取消，不再发出
+    CONNECTION_CLOSE（对端等空闲超时）；有序关闭须先 `close` 再 `waitIdle`。
+- **流作为 IoStream（`QuicStream`）**：一对 `SendStream` / `RecvStream` 实现 neton-io `IoStream`：`read` 从 `RecvStream` 直接读入 `dst` 的底层数组
+  （追加，finish 后 -1），`write` 写完 `src` 的全部字节（流复制数据，返回即可复用；按接受量推进），`flush` 无操作（同 quinn `poll_flush`），
+  `shutdownOutput` = finish，`close` = 生命周期规则（不关闭连接）。能力声明 `HalfClose`、`ResumableAfterCancel`；不声明超时与 `AnyThread`
+  （流属于端点的反应器）。错误为 `QuicStreamException`（`IoException`，携带原始流错误；对端 reset 不是 EOF），关闭时挂起的操作得到
+  `ClosedException`。另有 `Connection.openBiStream()` / `acceptBiStream()`。测试（`QuicStreamTest` 5 个）：neton-io `io-testkit` 的
+  `IoStreamConformance` 全部必选项与按能力的可选项（含对端 reset 钩子；把能力改为错误声明时套件报告失败，确认它确实在检查）、`Framed` +
+  `LineCodec` 的 200 行回显、对端 reset、关闭规则。单向流未提供 IoStream 形式。
+- **预算的验证（`DriverBudgetTest` 6 个）**：2000 个垃圾数据报分 20 次突发、上限设为 8：每轮最多 8 条，250–260 次让出，同时运行的另一协程
+  得到约 3 万次执行；4 MiB 批量传输：每次驱动最多 20 个数据报、每次发送最多 10 个分段（Linux GSO；macOS 无 GSO 为 1），Linux 145 次、
+  macOS 42 次因发送预算让出；并发读 / 写抛 `IllegalStateException`；关闭恢复挂起的读 / 写。
+- **公平性测试（§3 "测试"，`FairnessTest`）**：服务端点、重连接的客户端点、轻连接的客户端点全在同一个反应器上。重连接持续双向满速收发
+  （只受流量控制与拥塞控制限制），预热到 16 MiB 后，20 条轻连接每隔 20 ms 到达，各做一次握手与 20 次 32 字节请求 / 应答（间隔 5 ms）。
+  断言：握手最大 ≤ 500 ms，请求 p99 ≤ 250 ms、最大 ≤ 500 ms，轻阶段内重连接至少传输 4 MiB（证明负载与轻连接同时存在）。另有无重连接的基线
+  （只打印）。测得（debug 测试二进制）：
+
+  | 环境 | 握手 p50 / 最大 | 请求 p50 / p99 / 最大 | 重连接在轻阶段 | 基线请求 p99 |
+  |---|---|---|---|---|
+  | macOS arm64（约 20 次） | 31–82 / 64–122 ms | 32–66 / 60–113 / ≤ 124 ms | 18–32 MiB / 1.5–2.2 s | 2–11 ms |
+  | colima Linux arm64，2 vCPU，epoll 与 io_uring（各 6 次） | 9–13 / 14–17 ms | 11–13 / 16–18 / ≤ 20 ms | 12 MiB / 0.74 s | 3–4 ms |
+
+  - 构成：轻连接的数据报与重连接的在途数据（受其流窗口 1.25 MB 约束）排在服务端套接字的同一个接收队列里，按到达顺序处理，所以负载下的延迟约为
+    处理一个窗口所需的时间，是共享队列的排队，不是调度饥饿。上限取实测值的 4–5 倍，低于丢失一个 Initial 后恢复所需的约 1 s（初始 RTT 333 ms），
+    所以饥饿（等到重连接结束）或需要丢包恢复的握手都会失败。测试中服务端的接受循环最初逐个等待握手完成，把握手串行化（握手 p50 约 400 ms），
+    改为每个握手一个协程后降到上表数值——这是测试本身的问题，已在提交前修正。
+  - 消融（去掉两项预算：条数与时间片无限、每次驱动不限数据报）：macOS 上结果不变（请求 p99 85–86 ms）；Linux 上请求 p50 15–16 ms、p99 19 ms，
+    比有预算时略差（11–13 / 16–18 ms）。即在本测试的负载下（单个重连接，受流窗口约束，没有单个任务长时间占用线程），延迟由共享接收队列决定，
+    预算的作用有限；预算防止的是单个任务无界地处理积压（接收积压、大量可发数据），由 `DriverBudgetTest` 直接验证。此测试只有 400 个请求样本，
+    p99 是粗略值；neton-io §28.4 规程的 F 类测量（153、样本 ≥ 10 万、独立负载发生器）尚未进行（153 当前不可达）。
+- **测试**：490 个（此前 464 + 26：`DriverBudgetTest` 6、`LifecycleTest` 13、`QuicStreamTest` 5、`FairnessTest` 2），macosArm64 487 通过、3 个跳过
+  （quinn 的 3 个压力测试）；colima Linux arm64 虚拟机（Ubuntu 24.04）上 `NETON_IO_DRIVER=epoll` 与 `iouring` 各 490 个、487 通过、3 个跳过。
+  新增的计时相关测试（预算、公平性、生命周期、IoStream、`DriverTest`）在 macOS 上各连跑 3–15 次、在虚拟机两种驱动上各 5 次，无失败。
+  首次在 Linux 上运行时，接收预算测试一次发出 1000 个小数据报，超过 Linux 默认接收缓冲（只到达 222 个），改为分批突发。
+- **仍未完成**：真实 TLS（§4）及其上的握手、证书、ALPN、0-RTT、密钥更新、Retry 验收与 quinn 互通；多核（§3，首版不做）；亚毫秒计时（§9）；
+  作用域取消时的有序关闭；单向流的 IoStream 形式；按 neton-io §28.4 规程的公平性与性能测量（§6，需 153）；驱动层热路径的分配与指令数
+  （callgrind，§7）未测。
