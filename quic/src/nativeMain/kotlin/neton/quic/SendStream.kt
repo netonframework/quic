@@ -69,6 +69,8 @@ class SendStream internal constructor(
      * writes borrow the stream mutably; here a second concurrent write throws [IllegalStateException] (it would
      * otherwise replace the first one's wake-up and leave it waiting forever).
      */
+    private var writesSinceYield = 0
+
     private suspend inline fun execute(writeFn: (ProtoSendStream) -> WriteResult): Written {
         check(!writing) { "concurrent write on $this" }
         writing = true
@@ -86,9 +88,16 @@ class SendStream internal constructor(
             when (val result = writeFn(conn.inner.sendStream(id))) {
                 is Written -> {
                     conn.wake()
+                    // Cooperative budget (tokio's coop budget in quinn): a writer that keeps finding credit never
+                    // suspends, so the connection's driver it just woke would not run — nothing sent, no packet
+                    // handled (a STOP_SENDING waited for a whole stream window). Yield after a bounded number of writes.
+                    if (++writesSinceYield >= COOP_WRITES) {
+                        writesSinceYield = 0
+                        kotlinx.coroutines.yield()
+                    }
                     return result
                 }
-                ProtoWriteError.Blocked -> conn.awaitWritable(id)
+                ProtoWriteError.Blocked -> { writesSinceYield = 0; conn.awaitWritable(id) }
                 is ProtoWriteError.Stopped -> throw WriteError.Stopped(result.errorCode)
                 ProtoWriteError.ClosedStream -> throw WriteError.ClosedStream()
             }
@@ -177,3 +186,7 @@ class SendStream internal constructor(
 
     override fun toString(): String = "SendStream($id)"
 }
+
+/** Writes that complete without suspending before a writer yields to the reactor (see [SendStream.write]). */
+private const val COOP_WRITES = 32
+
