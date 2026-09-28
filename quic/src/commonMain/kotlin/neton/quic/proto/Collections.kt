@@ -109,6 +109,17 @@ internal class LongMap<V : Any>(expected: Int = 4) {
         size = 0
     }
 
+    /** Remove every entry, adding its non-null value to [out] (quinn's `HashMap::drain`, used by the driver). */
+    @Suppress("UNCHECKED_CAST")
+    fun drainValuesTo(out: MutableList<V>) {
+        if (size == 0) return
+        for (i in keys.indices) {
+            if (keys[i] == EMPTY_KEY) continue
+            (values[i] as V?)?.let { out.add(it) }
+        }
+        clear()
+    }
+
     private fun grow() {
         val oldKeys = keys
         val oldValues = values
