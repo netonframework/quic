@@ -1,5 +1,6 @@
 package neton.quic.proto
 
+import neton.io.net.SocketAddress
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Duration.Companion.milliseconds
@@ -7,10 +8,9 @@ import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.ExperimentalTime
 
-// Endpoint-level configuration (quinn-proto `config/mod.rs`): the parts the recovery, token and transport
-// configuration need. `ServerConfig` and `ClientConfig` hold the TLS configurations and follow with the TLS layer
-// (SPEC §4); `EndpointConfig`'s default with a random HMAC-SHA256 reset key is `EndpointConfig.default()` in the
-// native source set (the HMAC comes from openssl-kotlin).
+// Endpoint-level configuration (quinn-proto `config/mod.rs`). `EndpointConfig`'s default with a random HMAC-SHA256
+// reset key is `EndpointConfig.default()`, and `ServerConfig.withCrypto` (a random HKDF token key) is in the native
+// source set: both keys come from openssl-kotlin.
 
 /**
  * Global configuration for the endpoint, affecting all connections (config/mod.rs:37).
@@ -155,6 +155,176 @@ class ValidationTokenConfig {
     }
 
     override fun toString(): String = "ServerValidationTokenConfig { lifetime: $lifetime, sent: $sent, .. }"
+}
+
+/**
+ * Parameters governing incoming connections (config/mod.rs:197). Default values should be suitable for most internet
+ * applications.
+ *
+ * ⚖️ quinn shares it as an `Arc` and clones it to derive variants; here it is a mutable object with [copy]. A pending
+ * incoming connection keeps the instance it arrived with, so changing an instance in use affects connections that
+ * refer to it (quinn's cannot change once shared).
+ */
+class ServerConfig(
+    /** TLS configuration used for incoming connections; must be set to use TLS 1.3 only. */
+    var crypto: CryptoServerConfig,
+    /** Used to generate one-time AEAD keys to protect handshake tokens. */
+    tokenKey: HandshakeTokenKey,
+) {
+    /** Transport configuration to use for incoming connections. */
+    var transport: TransportConfig = TransportConfig()
+
+    /** Configuration for sending and handling validation tokens. */
+    var validationToken: ValidationTokenConfig = ValidationTokenConfig()
+
+    internal var tokenKey: HandshakeTokenKey = tokenKey
+        private set
+    internal var retryTokenLifetime: Duration = 15.seconds
+        private set
+    internal var migration: Boolean = true
+        private set
+    internal var preferredAddressV4: SocketAddress? = null
+        private set
+    internal var preferredAddressV6: SocketAddress? = null
+        private set
+    internal var maxIncoming: Int = 1 shl 16
+        private set
+    internal var incomingBufferSize: Long = 10L shl 20
+        private set
+    internal var incomingBufferSizeTotal: Long = 100L shl 20
+        private set
+    internal var timeSource: TimeSource = StdSystemTime
+        private set
+
+    /** Set a custom [TransportConfig]. */
+    fun transportConfig(transport: TransportConfig): ServerConfig { this.transport = transport; return this }
+
+    /** Set a custom [ValidationTokenConfig]. */
+    fun validationTokenConfig(validationToken: ValidationTokenConfig): ServerConfig { this.validationToken = validationToken; return this }
+
+    /** Private key used to authenticate data included in handshake tokens. */
+    fun tokenKey(value: HandshakeTokenKey): ServerConfig { tokenKey = value; return this }
+
+    /** Duration after a retry token was issued for which it's considered valid. Defaults to 15 seconds. */
+    fun retryTokenLifetime(value: Duration): ServerConfig { retryTokenLifetime = value; return this }
+
+    /**
+     * Whether to allow clients to migrate to new addresses. Improves behavior for clients that move between different
+     * internet connections or suffer NAT rebinding. Enabled by default.
+     */
+    fun migration(value: Boolean): ServerConfig { migration = value; return this }
+
+    /** The preferred IPv4 address that will be communicated to clients during handshaking. */
+    fun preferredAddressV4(address: SocketAddress?): ServerConfig {
+        require(address == null || address.isIpv4) { "not an IPv4 address" }
+        preferredAddressV4 = address
+        return this
+    }
+
+    /** The preferred IPv6 address that will be communicated to clients during handshaking. */
+    fun preferredAddressV6(address: SocketAddress?): ServerConfig {
+        require(address == null || address.isIpv6) { "not an IPv6 address" }
+        preferredAddressV6 = address
+        return this
+    }
+
+    /**
+     * Maximum number of [Incoming] to allow to exist at a time. While this limit is reached, new incoming connection
+     * attempts are dropped. Defaults to 65536.
+     */
+    fun maxIncoming(value: Int): ServerConfig {
+        require(value >= 0) { "must not be negative" }
+        maxIncoming = value
+        return this
+    }
+
+    /**
+     * Maximum number of received bytes to buffer for each [Incoming] (not counting its first packet). Packets received
+     * in excess are dropped, which may cause 0-RTT or handshake data to have to be retransmitted. Defaults to 10 MiB.
+     */
+    fun incomingBufferSize(value: Long): ServerConfig {
+        require(value >= 0) { "must not be negative" }
+        incomingBufferSize = value
+        return this
+    }
+
+    /** Maximum number of received bytes to buffer for all [Incoming] collectively. Defaults to 100 MiB. */
+    fun incomingBufferSizeTotal(value: Long): ServerConfig {
+        require(value >= 0) { "must not be negative" }
+        incomingBufferSizeTotal = value
+        return this
+    }
+
+    /** Object to get the current wall-clock time; defaults to [StdSystemTime]. */
+    fun timeSource(value: TimeSource): ServerConfig { timeSource = value; return this }
+
+    internal fun hasPreferredAddress(): Boolean = preferredAddressV4 != null || preferredAddressV6 != null
+
+    /** quinn's `Clone`: the crypto configuration, keys, token log and time source are shared, as quinn's `Arc`s. */
+    fun copy(): ServerConfig = ServerConfig(crypto, tokenKey).also {
+        it.transport = transport
+        it.validationToken = validationToken
+        it.retryTokenLifetime = retryTokenLifetime
+        it.migration = migration
+        it.preferredAddressV4 = preferredAddressV4
+        it.preferredAddressV6 = preferredAddressV6
+        it.maxIncoming = maxIncoming
+        it.incomingBufferSize = incomingBufferSize
+        it.incomingBufferSizeTotal = incomingBufferSizeTotal
+        it.timeSource = timeSource
+    }
+
+    override fun toString(): String =
+        "ServerConfig { transport: $transport, retry_token_lifetime: $retryTokenLifetime, " +
+            "validation_token: $validationToken, migration: $migration, preferred_address_v4: $preferredAddressV4, " +
+            "preferred_address_v6: $preferredAddressV6, max_incoming: $maxIncoming, " +
+            "incoming_buffer_size: $incomingBufferSize, incoming_buffer_size_total: $incomingBufferSizeTotal, .. }"
+
+    companion object
+}
+
+/**
+ * Configuration for outgoing connections (config/mod.rs:553). Default values should be suitable for most internet
+ * applications.
+ */
+class ClientConfig(
+    /** Cryptographic configuration to use. */
+    internal val crypto: CryptoClientConfig,
+) {
+    internal var transport: TransportConfig = TransportConfig()
+        private set
+    internal var tokenStore: TokenStore = TokenMemoryCache()
+        private set
+    internal var initialDstCidProvider: () -> ConnectionId = { RandomConnectionIdGenerator(MAX_CID_SIZE).generateCid() }
+        private set
+    internal var version: Int = 1
+        private set
+
+    /**
+     * Configure how to populate the destination CID of the initial packet when attempting to establish a new
+     * connection. By default random bytes of reasonable length; a replacement MUST be at least 8 bytes long and
+     * unpredictable (RFC 9000 §7.2).
+     */
+    fun initialDstCidProvider(provider: () -> ConnectionId): ClientConfig { initialDstCidProvider = provider; return this }
+
+    /** Set a custom [TransportConfig]. */
+    fun transportConfig(transport: TransportConfig): ClientConfig { this.transport = transport; return this }
+
+    /** Set a custom [TokenStore]. Defaults to [TokenMemoryCache], which is suitable for most internet applications. */
+    fun tokenStore(store: TokenStore): ClientConfig { tokenStore = store; return this }
+
+    /** Set the QUIC version to use. */
+    fun version(version: Int): ClientConfig { this.version = version; return this }
+
+    /** quinn's `Clone`: the transport and crypto configurations and the token store are shared, as quinn's `Arc`s. */
+    fun copy(): ClientConfig = ClientConfig(crypto).also {
+        it.transport = transport
+        it.tokenStore = tokenStore
+        it.initialDstCidProvider = initialDstCidProvider
+        it.version = version
+    }
+
+    override fun toString(): String = "ClientConfig { transport: $transport, version: $version, .. }"
 }
 
 /** Errors in the configuration of an endpoint (config/mod.rs:629). */
