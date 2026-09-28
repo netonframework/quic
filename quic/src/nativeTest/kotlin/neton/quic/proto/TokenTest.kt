@@ -12,49 +12,20 @@ import kotlin.test.assertNull
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * A NON-cryptographic stand-in for the HKDF + AES-GCM token key (test code only, SPEC §4): a keyed FxHash
- * keystream and a 16-byte keyed tag. It makes seal/open round-trip and reject garbage, which is all the token
- * format tests below need; the real key comes from the crypto layer.
- */
-private class FakeTokenKey(private val master: ByteArray) : HandshakeTokenKey {
-    override fun aeadFromHkdf(randomBytes: ByteArray): AeadKey {
-        val k = FxHasher().apply { write(master, 0, master.size); write(randomBytes, 0, randomBytes.size) }.finish()
-        return object : AeadKey {
-            fun stream(i: Int): Byte = FxHasher().apply { writeU64(k); writeU64(i.toLong()) }.finish().toByte()
-            fun tag(ct: ByteArray, n: Int): ByteArray = ByteArray(16) { j ->
-                FxHasher().apply { writeU64(k xor j.toLong()); write(ct, 0, n) }.finish().toByte()
-            }
-
-            override fun seal(data: ByteArray, additionalData: ByteArray): ByteArray {
-                val ct = ByteArray(data.size) { (data[it].toInt() xor stream(it).toInt()).toByte() }
-                return ct + tag(ct, ct.size)
-            }
-
-            override fun open(data: ByteArray, additionalData: ByteArray): ByteArray {
-                if (data.size < 16) throw CryptoError()
-                val n = data.size - 16
-                if (!constantTimeEquals(tag(data, n), data.copyOfRange(n, data.size))) throw CryptoError()
-                return ByteArray(n) { (data[it].toInt() xor stream(it).toInt()).toByte() }
-            }
-        }
-    }
-}
-
 class TokenTest {
 
     private fun masterKey() = ByteArray(64).also { secureRandom(it) }
 
     private fun tokenRoundTrip(payload: TokenPayload): TokenPayload {
         val token = Token.new(payload, Random.Default)
-        val key = FakeTokenKey(masterKey())
+        val key = HkdfSha256TokenKey.fromMasterKey(masterKey())
         val encoded = token.encode(key)
         val decoded = Token.decode(key, encoded) ?: throw AssertionError("token didn't decrypt / decode")
         assertEquals(token.nonce, decoded.nonce)
         return decoded.payload
     }
 
-    // ---- token.rs tests (with the stand-in key; see FakeTokenKey) ----
+    // ---- token.rs tests ----
 
     @Test
     fun retryTokenSanity() {
@@ -78,7 +49,7 @@ class TokenTest {
 
     @Test
     fun invalidTokenReturnsErr() {
-        val key = FakeTokenKey(masterKey())
+        val key = HkdfSha256TokenKey.fromMasterKey(masterKey())
         val invalidToken = ByteArray(32).also { secureRandom(it) }
         // Garbage sealed data returns an error.
         assertNull(Token.decode(key, invalidToken))
@@ -88,7 +59,7 @@ class TokenTest {
 
     private val remote = SocketAddress.ipv4(192, 0, 2, 1, 5000)
     private val dcid = ConnectionId.of(hex("0102030405060708"))
-    private val key = FakeTokenKey(ByteArray(64) { it.toByte() })
+    private val key = HkdfSha256TokenKey.fromMasterKey(ByteArray(64) { it.toByte() })
 
     private fun header(token: ByteArray) =
         InitialHeader(dcid, ConnectionId.of(byteArrayOf(9)), Bytes.wrap(token), PacketNumber.U8(0), 1)

@@ -49,31 +49,35 @@ class PacketTest {
         }
     }
 
-    /**
-     * packet.rs `header_encoding`, minus the cryptography: the reference protects the packet with the real
-     * RFC 9001 Initial keys and compares ciphertext, which needs the crypto layer. Here the header layout, the
-     * length field and the decode path are checked with header protection and AEAD left out; the expected
-     * bytes are the reference's unprotected header (`c000...402100`). The protection step itself is covered by
-     * the RFC 9001 Appendix A vectors below.
-     */
     @Test
     fun headerEncoding() {
         val dcid = ConnectionId.of(hex("06b858ec6f80452b"))
+        val client = initialKeys(v1, dcid, Side.Client)
         val header = InitialHeader(dcid, ConnectionId.of(ByteArray(0)), Bytes.EMPTY, PacketNumber.U8(0), v1)
         val buf = Buffer(128)
         val encode = header.encode(buf)
-        val headerLen = buf.len
-        val tagLen = 16
-        buf.writeBytes(ByteArray(16 + tagLen))
-        encode.finish(buf, NoHeaderProtection(), null, 0)
+        buf.writeBytes(ByteArray(16 + client.packet.local.tagLen))
+        encode.finish(buf, client.header.local, client.packet.local, 0)
         val bytes = buf.bytes()
-        assertContentEquals(hex("c0000000010806b858ec6f80452b0000402100"), bytes.copyOf(headerLen))
+        assertContentEquals(
+            hex(
+                """c8000000010806b858ec6f80452b00004021be
+                 3ef50807b84191a196f760a6dad1e9d1c430c48952cba0148250c21c0a6a70e1""",
+            ),
+            bytes,
+        )
 
+        val server = initialKeys(v1, dcid, Side.Server)
         val decode = PartialDecode.decode(bytes, FixedLengthConnectionIdParser(0), DEFAULT_SUPPORTED_VERSIONS, false)
         assertFalse(decode.hasRest)
-        val packet = decode.finish(NoHeaderProtection())
+        val packet = decode.finish(server.header.remote)
         assertContentEquals(hex("c0000000010806b858ec6f80452b0000402100"), packet.headerData())
-        assertContentEquals(ByteArray(32), packet.payload())
+        packet.payloadLen = server.packet.remote.decrypt(
+            0,
+            packet.data, packet.headerStart, packet.headerStart + packet.headerLen,
+            packet.data, packet.payloadStart, packet.payloadStart + packet.payloadLen,
+        )
+        assertContentEquals(ByteArray(16), packet.payload())
         val h = assertIs<InitialHeader>(packet.header)
         assertEquals(PacketNumber.U8(0), h.number)
     }

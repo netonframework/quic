@@ -1,12 +1,32 @@
 package neton.quic.proto
 
-// The crypto seams the encoding layer needs (quinn-proto `crypto.rs:148-209`). Nothing here implements
-// cryptography: the TLS / crypto library (openssl-kotlin, SPEC §4) implements these interfaces. The packet
+// The crypto seams the encoding layer needs (quinn-proto `crypto.rs:97-223`). Nothing here implements
+// cryptography: the implementations on openssl-kotlin primitives are in nativeMain (`PacketProtection.kt`,
+// `TokenKeys.kt`); the TLS handshake will supply the Handshake / 1-RTT secrets (SPEC §4). The packet
 // layout rules around them (where the sample is taken, which header bits and packet number bytes the mask
 // covers) are protocol, not crypto, and live here in [HeaderProtection].
 
 /** Generic crypto error (quinn `CryptoError`). */
 class CryptoError(message: String = "crypto error") : Exception(message)
+
+/** The QUIC version is not supported by the crypto layer (quinn `crypto::UnsupportedVersion`, crypto.rs:218). */
+class UnsupportedVersion(val version: Int) : Exception("unsupported QUIC version 0x${version.toUInt().toString(16)}")
+
+/** A pair of keys for bidirectional communication (quinn `crypto::KeyPair`, crypto.rs:97). */
+class KeyPair<T>(
+    /** Key for encrypting data. */
+    val local: T,
+    /** Key for decrypting data. */
+    val remote: T,
+)
+
+/** A complete set of keys for a certain packet space (quinn `crypto::Keys`, crypto.rs:105). */
+class Keys(
+    /** Header protection keys. */
+    val header: KeyPair<HeaderKey>,
+    /** Packet protection keys. */
+    val packet: KeyPair<PacketKey>,
+)
 
 /**
  * Keys used to protect packet headers (quinn `crypto::HeaderKey`, crypto.rs:168; RFC 9001 §5.4).
