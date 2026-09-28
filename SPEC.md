@@ -468,3 +468,22 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   排序的 `LinkedHashMap`，两者用自旋锁（Kotlin common 没有阻塞互斥）；`debug_assert!` 只在调试二进制中执行；BBR 默认 `Random.Default`，
   `PacketNumberFilter` 注入 `Random`。
 - 延后：qlog（§8）；`ServerConfig` / `ClientConfig`（需要 TLS 配置，§4）；由 `TransportConfig` 生成 `TransportParameters`（连接步骤）。
+
+### 11.5 连接状态机与端点（2026-09-28，TLS 以测试替身代替）
+- 代码：`Connection`（`connection/mod.rs` 全部：握手状态、收包解密、帧处理、丢包检测与 PTO、拥塞 / pacing、ACK、密钥更新、0-RTT、迁移与路径验证、
+  CID 管理、无状态重置、空闲超时、关闭 / draining、数据报、流、MTU / ECN / GSO、`pollTransmit` / `handleEvent` / `handleTimeout` / `poll`）、
+  `Endpoint`（路由、建连、Retry 与令牌、版本协商、无状态重置、`accept` / `refuse` / `retry` / `ignore`）、`PacketBuilder`、`PacketCrypto`、
+  `CryptoSession`（quinn 的 `crypto.rs` 三个 trait）、`Events`、`ServerConfig` / `ClientConfig`。
+- 测试替身：`MockTls`（只在 `nativeTest`，生产代码不可达）：固定的握手字节经 CRYPTO 帧交换，密钥用真实的 `PacketProtection` 原语派生，支持传输
+  参数、ALPN、0-RTT、密钥更新、导出器。`PairUtil` 移植 `tests/util.rs` 的虚拟时间双端模拟。
+- 测试：433 个（此前 318 + 115）连续三次全过，新增测试另连跑 400 次无失败。`tests/mod.rs` 109 → 103、`tests/token.rs` 7 → 7、模块内 1。
+  - 待真实 TLS：`reject_self_signed_server_cert`、`reject_missing_client_cert`、`server_alpn_unset`、`client_alpn_unset`、`alpn_mismatch`；另
+    `alpn_success`、0-RTT、密钥更新、`export_keying_material`、大证书 / 大 ClientHello 等在替身上通过，接入真实 TLS 后须复验。
+  - 不适用：`endpoint_and_connection_impl_send_sync`（Rust 的 Send / Sync 编译期检查）。
+  - `cid_rotation` 断言 quinn 实际产生的区间（参考中的 `assert_matches!(x, _bound)` 匹配任何值，已在 Rust 中确认）。
+- ⚖️：每包的记录（包构造器、已发送帧、已发送包记录、新确认区间、丢失包列表）为复用字段；1-RTT 头部直接写出；"无"用哨兵；ACK 帧大小先算后写
+  （`Buffer` 不能截断）；协议错误为异常；`StreamEvent` 直接是 `Event` 的子类型；随机源为按种子的 `kotlin.random.Random`（与 quinn 的 ChaCha12 序列
+  不同）；加密 trait 命名为 `CryptoSession` / `CryptoClientConfig` / `CryptoServerConfig`；本地 IP 用端口 0 的 `SocketAddress`；端点的 CID 映射用
+  `HashMap`、slab 复用最近释放的键；未处理的 `Incoming` 没有析构时的警告；配置为可变对象 + `copy()`。
+- 驱动层（§3，下一步）所需：每个数据报一个可保留的字节数组（原地解密、零复制交出流数据）；按 `Transmit` 发送（ECN、GSO `segmentSize`、源 IP）；
+  事件在端点与连接之间转发；每连接一个单调截止时间（亚毫秒 pacing）；只在套接字保证不分片时开启 MTUD；真实 TLS 实现 `CryptoSession`。
