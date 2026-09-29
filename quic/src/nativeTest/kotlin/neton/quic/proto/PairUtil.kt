@@ -55,6 +55,12 @@ internal class ConnPair(val server: TestEndpoint, val client: TestEndpoint) {
     /** One-way latency. */
     var latency: Duration = Duration.ZERO
 
+    /** Impairment of the client → server direction; `null` is a perfect link (quinn's). */
+    var clientToServer: LinkImpairment? = null
+
+    /** Impairment of the server → client direction; `null` is a perfect link (quinn's). */
+    var serverToClient: LinkImpairment? = null
+
     /** Number of spin bit flips. */
     var spins = 0L
     private var lastSpin = false
@@ -101,7 +107,7 @@ internal class ConnPair(val server: TestEndpoint, val client: TestEndpoint) {
             }
             if (server.addr == transmit.destination) {
                 val ecn = setCongestionExperienced(transmit.ecn, congestionExperienced)
-                server.inbound.addLast(Inbound(time + latency, ecn, buffer))
+                deliver(server.inbound, Inbound(time + latency, ecn, buffer), clientToServer)
             }
         }
     }
@@ -113,7 +119,56 @@ internal class ConnPair(val server: TestEndpoint, val client: TestEndpoint) {
             if (packetSize(transmit, buffer) > mtu) continue // dropping packet (max size exceeded)
             if (client.addr == transmit.destination) {
                 val ecn = setCongestionExperienced(transmit.ecn, congestionExperienced)
-                client.inbound.addLast(Inbound(time + latency, ecn, buffer))
+                deliver(client.inbound, Inbound(time + latency, ecn, buffer), serverToClient)
+            }
+        }
+    }
+
+    /**
+     * Queue [packet] towards an endpoint through [impairment]: lost, delivered, delivered late (and so overtaken) or
+     * twice. The queue stays ordered by arrival time. Each copy gets its own bytes, as packets are decrypted in place.
+     */
+    private fun deliver(queue: ArrayDeque<Inbound>, packet: Inbound, impairment: LinkImpairment?) {
+        if (impairment == null) {
+            insertByTime(queue, packet)
+            return
+        }
+        val fate = impairment.fate(packet.data)
+        for ((i, extra) in fate.withIndex()) {
+            val data = if (i == 0) packet.data else packet.data.copyOf()
+            insertByTime(queue, Inbound(packet.time + extra, packet.ecn, data))
+        }
+    }
+
+    private fun insertByTime(queue: ArrayDeque<Inbound>, packet: Inbound) {
+        var at = queue.size
+        while (at > 0 && queue[at - 1].time > packet.time) at--
+        queue.add(at, packet)
+    }
+
+    /**
+     * Drive both endpoints until [done] holds, also when both connections are idle while datagrams are still in flight
+     * (quinn's [step] stops there, which a lossy link with delays reaches). Returns false if nothing is left to happen
+     * (no datagram in flight, no timer) before [done] holds — a deadlock — or if [limit] of virtual time passes.
+     */
+    fun driveUntil(limit: Duration, done: () -> Boolean): Boolean {
+        val deadline = time + limit
+        var stuck = 0
+        while (true) {
+            driveClient()
+            driveServer()
+            if (done()) return true
+            // [done] may have written or read: let the endpoints send what that made sendable before looking for the
+            // next event, or a write with nothing in flight would look like a stall
+            driveClient()
+            driveServer()
+            val t = minOpt(client.nextWakeup(), server.nextWakeup())
+            if (t.isNone || t > deadline) return false
+            if (t > time) {
+                time = t
+                stuck = 0
+            } else {
+                check(++stuck < 10_000) { "virtual time does not advance at $time" }
             }
         }
     }
