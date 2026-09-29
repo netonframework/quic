@@ -53,6 +53,7 @@ import neton.openssl.c.d2i_AutoPrivateKey
 import neton.openssl.c.d2i_X509
 import neton.openssl.c.i2d_X509
 import neton.openssl.c.neton_openssl_tls13_only
+import neton.openssl.c.neton_tls_groups
 import kotlin.concurrent.AtomicInt
 import kotlin.experimental.ExperimentalNativeApi
 import kotlin.native.ref.createCleaner
@@ -165,6 +166,7 @@ class TlsClientConfig private constructor(
     clientCertificate: Certificates?,
     clientKey: PrivateKey?,
     cipherSuites: List<CipherSuite>,
+    groups: String?,
     @Suppress("UNUSED_PARAMETER") insecure: Boolean,
 ) : CryptoClientConfig, AutoCloseable {
 
@@ -175,6 +177,9 @@ class TlsClientConfig private constructor(
      *   QUIC).
      * @param clientCertificate the certificate chain (leaf first) to present when the server asks, with [clientKey].
      * @param cipherSuites the TLS 1.3 cipher suites offered, in preference order.
+     * @param groups the key exchange groups, in OpenSSL's list syntax (e.g. `"X25519:P-256"`); `null` keeps OpenSSL's
+     *   default, which sends an X25519MLKEM768 (post-quantum hybrid) and an X25519 key share — a ClientHello of about
+     *   1.5 KB, sent in two Initial datagrams. `"X25519"` fits the ClientHello in one.
      */
     constructor(
         trustAnchors: Certificates,
@@ -182,7 +187,8 @@ class TlsClientConfig private constructor(
         clientCertificate: Certificates? = null,
         clientKey: PrivateKey? = null,
         cipherSuites: List<CipherSuite> = CipherSuite.entries,
-    ) : this(trustAnchors, alpnProtocols, clientCertificate, clientKey, cipherSuites, false)
+        groups: String? = null,
+    ) : this(trustAnchors, alpnProtocols, clientCertificate, clientKey, cipherSuites, groups, false)
 
     internal val alpn: List<ByteArray> = validateAlpn(alpnProtocols)
     internal val alpnWire: ByteArray = alpnWire(alpn)
@@ -190,7 +196,7 @@ class TlsClientConfig private constructor(
 
     init {
         require((clientCertificate == null) == (clientKey == null)) { "a client certificate needs its private key" }
-        ctx = SslContextResource(newQuicContext(cipherSuites) { ctx ->
+        ctx = SslContextResource(newQuicContext(cipherSuites, groups) { ctx ->
             if (trustAnchors != null) {
                 SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null)
                 addTrustAnchors(ctx, trustAnchors)
@@ -219,7 +225,8 @@ class TlsClientConfig private constructor(
         fun dangerousNoServerVerificationForTestsOnly(
             alpnProtocols: List<ByteArray> = emptyList(),
             cipherSuites: List<CipherSuite> = CipherSuite.entries,
-        ): TlsClientConfig = TlsClientConfig(null, alpnProtocols, null, null, cipherSuites, true)
+            groups: String? = null,
+        ): TlsClientConfig = TlsClientConfig(null, alpnProtocols, null, null, cipherSuites, groups, true)
     }
 }
 
@@ -231,6 +238,8 @@ class TlsClientConfig private constructor(
  * @param alpnProtocols supported application protocols in preference order (the server's order decides); empty for
  *   none. A client offering none of them, or offering none while the server has some, fails the handshake with
  *   no_application_protocol (120), as rustls does for QUIC.
+ * @param groups the key exchange groups accepted, in OpenSSL's list syntax; `null` keeps OpenSSL's default (with the
+ *   X25519MLKEM768 hybrid).
  */
 class TlsServerConfig(
     certificateChain: Certificates,
@@ -238,9 +247,10 @@ class TlsServerConfig(
     alpnProtocols: List<ByteArray> = emptyList(),
     clientAuth: ClientAuth = ClientAuth.None,
     cipherSuites: List<CipherSuite> = CipherSuite.entries,
+    groups: String? = null,
 ) : CryptoServerConfig, AutoCloseable {
     internal val alpn: List<ByteArray> = validateAlpn(alpnProtocols)
-    internal val ctx: SslContextResource = SslContextResource(newQuicContext(cipherSuites) { ctx ->
+    internal val ctx: SslContextResource = SslContextResource(newQuicContext(cipherSuites, groups) { ctx ->
         useIdentity(ctx, certificateChain, privateKey)
         when (clientAuth) {
             ClientAuth.None -> SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)
@@ -262,10 +272,10 @@ class TlsServerConfig(
     @Suppress("unused")
     private val cleaner = createCleaner(ctx) { it.close() }
 
-    override fun initialKeys(version: Int, dstCid: ConnectionId): Keys = initialKeys(version, dstCid, Side.Server)
+    override fun initialKeys(version: Int, dstCid: ConnectionId): Keys = neton.quic.proto.initialKeys(version, dstCid, Side.Server)
 
     override fun retryTag(version: Int, origDstCid: ConnectionId, packet: ByteArray, offset: Int, length: Int): ByteArray =
-        retryTag(version, origDstCid, packet, offset, length)
+        neton.quic.proto.retryTag(version, origDstCid, packet, offset, length)
 
     override fun startSession(version: Int, params: TransportParameters): CryptoSession =
         TlsSession.server(this, version, params)
@@ -338,8 +348,9 @@ private const val SSL_OP_NO_COMPRESSION = 0x20000uL // SSL_OP_BIT(17)
 private const val SSL_OP_NO_TICKET = 0x4000uL // SSL_OP_BIT(14)
 
 /** An SSL_CTX for QUIC: TLS 1.3 only, the given suites, no tickets / resumption / early data; [configure] adds the rest. */
-private inline fun newQuicContext(suites: List<CipherSuite>, configure: (CPointer<SSL_CTX>) -> Unit): CPointer<SSL_CTX> {
+private inline fun newQuicContext(suites: List<CipherSuite>, groups: String?, configure: (CPointer<SSL_CTX>) -> Unit): CPointer<SSL_CTX> {
     require(suites.isNotEmpty()) { "no cipher suites" }
+    require(groups == null || (groups.isNotEmpty() && '\u0000' !in groups)) { "invalid groups" }
     ERR_clear_error()
     val ctx = SSL_CTX_new(TLS_method()) ?: throw IllegalStateException("SSL_CTX_new failed: ${drainOpenSslErrors()}")
     try {
@@ -349,6 +360,7 @@ private inline fun newQuicContext(suites: List<CipherSuite>, configure: (CPointe
         check(SSL_CTX_set_max_early_data(ctx, 0u) == 1) { "no early data: ${drainOpenSslErrors()}" }
         val names = suites.distinct().joinToString(":") { it.openSslName }
         require(SSL_CTX_set_ciphersuites(ctx, names) == 1) { "cipher suites $names: ${drainOpenSslErrors()}" }
+        if (groups != null) require(neton_tls_groups(ctx, groups) == 1) { "groups $groups: ${drainOpenSslErrors()}" }
         configure(ctx)
         return ctx
     } catch (t: Throwable) {
