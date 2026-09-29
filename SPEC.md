@@ -684,7 +684,7 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   为真实 TLS）选择，专门的真实 TLS 测试显式使用真实会话。整个套件以 `real` 运行（macOS）：555 个中 541 通过、3 个跳过、11 个失败，均已
   逐一归因：0-RTT 5 个（本批不含）；替身专用 3 个（`alpnSuccess` 强转 `MockHandshakeData`，另两个用 `MockServerCrypto` 的大证书服务端配默认
   客户端，真实版本在 `RealTlsConnectionTest`）；ClientHello 占两个数据报导致按 `Incoming` 计数的 3 个（`validateThenRejectManually`、
-  `refusedAndRetriedAttemptsReleaseTheirInitialKeys`、`useTokenThenRetry`，以 `NETON_QUIC_TEST_TLS_GROUPS=X25519` 运行即通过）。
+  `refusedAndRetriedAttemptsReleaseTheirInitialKeys`、`useTokenThenRetry`，以 `NETON_QUIC_TEST_TLS_GROUPS=X25519` 运行即通过）。此后全部清零，见 §11.11。
 - **驱动层端到端**（`RealTlsDriverTest`，回环 UDP，6 个）：32 条双向流各约 48 KiB 的回显、期间强制 4 次密钥更新、之后再传一条流、以 7 关闭
   并由服务端看到 ApplicationClosed(7)；以 IP 地址连接；不受信任的服务端 → Transport(0x130)；ALPN 不符 → ConnectionClosed(0x178)；
   客户端认证；40 次建连 / 关闭后原生对象回到基线。
@@ -806,3 +806,56 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 - **局限**：TLS 为测试替身；中继一次服务一个客户端，不模拟 ECN 标记、MTU 变化与路径迁移（迁移、MTU 黑洞在 quinn 移植的测试中另有覆盖，
   但不在损伤链路上）；中继的延迟用每个数据报一个协程与毫秒级计时器实现；0-RTT 未在损伤链路上验证；驱动层场景的时间界限按负载很高的宿主设定
   （宽松）；与 quinn 的互通未做，两处修正是对 quinn 0.11.12 的偏离（⚖️），应向上游报告。
+
+### 11.11 整个套件在真实 TLS 上通过（2026-09-29，macOS）
+- **范围**：§11.9 记录的以 `NETON_QUIC_TEST_TLS=real` 运行整个套件时的失败逐一查明原因。原则：揭示库缺陷的修库（独立提交、回归测试
+  去掉修正即失败）；测试侧的差异让测试按模式区分，且不删除、不削弱任何断言；0-RTT 不在本批，相关测试在真实 TLS 下跳过并打印原因。
+- **逐项结果**：
+
+  | 原失败 | 原因 | 处理 |
+  |---|---|---|
+  | `DriverTest.zeroRtt`（超时） | **库缺陷**（见下）：服务端在握手完成前取得连接（`Connecting.into0Rtt`）后立即 `openUni`，永远等待。第二次连接取 0-RTT 密钥的断言尚未执行就挂住 | 修库；测试本身依赖 0-RTT，真实 TLS 下跳过 |
+  | `ConnectionTest.zeroRttHappypath`、`zeroRttIncomingBufferSize`、`zeroRttIncomingBufferSizeTotal`（`has0rtt()` 为假） | 真实会话不发票据，没有 0-RTT（本批不含，§11.9） | 真实 TLS 下跳过并打印原因；替身下照常运行 |
+  | `ConnectionTest.zeroRttRejection`（服务端 alert 50 length mismatch） | 测试显式用 `MockClientCrypto`（要改它的 ALPN 使票据失效），与真实服务端配对：替身的 ClientHello 不是 TLS，真实服务端以 decode_error 拒绝——行为正确 | 同上（依赖 0-RTT），跳过 |
+  | `ConnectionTest.alpnSuccess`（ClassCastException） | 测试把握手数据强转为 `MockHandshakeData` | 经 `TestTls.negotiatedProtocol` 读取（两种握手数据都认，其他类型即失败），断言不变 |
+  | `ConnectionTest.handshakeAntiDeadlockProbe`（客户端 alert 50） | 测试的大证书服务端写死为 `MockServerCrypto`，与真实客户端配对，替身的 ServerHello 被真实客户端拒绝 | `bigIdentityPair()` 按模式成对：真实 TLS 下为 1000 个名字的自签名证书与信任它的客户端 |
+  | `ConnectionTest.serverCanSend3InitalPackets`（期望 3 得 1） | 同上配对错误（得 1 是客户端收到 alert 的一个数据报）；配对正确后，默认的两数据报 ClientHello 使服务端首轮为 6 个 | 同上成对，并用 X25519 客户端（quinn 测试中 rustls ring 提供者只发 X25519，ClientHello 一个数据报），断言仍为 3；默认两数据报的情形已由 `RealTlsConnectionTest.serverCanSend3InitalPackets` 断言 2 与 6 |
+  | `ConnectionTest.validateThenRejectManually`（期望 0 得 1） | 每个不属于已有连接的 Initial 数据报都是一个独立的 `Incoming`，测试框架（与 quinn 的相同）逐个同步决定；两数据报的 ClientHello 使应用被问两次，quinn 的计数假定一个数据报 | 用 X25519 客户端（`oneDatagramHelloClientConfig`），断言不变；新增两数据报版本 `validateThenRejectWithATwoDatagramClientHello`，断言确切序列 `[未验证, 未验证, 已验证, 已验证]`（首个 ClientHello 两次 Retry，客户端只接受第一个；第二个 ClientHello 两次拒绝，客户端在第一个 CONNECTION_REFUSED 上关闭），两端最终不留连接与 CID |
+  | `TokenPairTest.useTokenThenRetry`（期望 true） | 同上。两数据报时第二个数据报带同一个 NEW_TOKEN 令牌，而令牌第一次使用后即记入令牌日志，第二次视为重用、不验证地址（quinn `use_same_token_twice` 的规则）——行为正确 | 用 X25519 客户端，断言不变；新增 `useTokenThenRetryWithATwoDatagramClientHello`，断言确切序列 `[(已验证, 可 Retry), (未验证, 可 Retry), (已验证, 不可 Retry)]`，连接建立并关闭后两端清空 |
+  | `KeyLifecycleTest.refusedAndRetriedAttemptsReleaseTheirInitialKeys`（期望 1 得 2） | **不是泄漏**：失败的是 `validated` 计数，不是密钥计数——两数据报的 ClientHello 在 Retry 之后的两个数据报各得一个 `Incoming`、各被拒一次（同上）。断言在密钥检查之前失败，所以两数据报下的释放此前未被检查过 | 用 X25519 客户端，断言不变；新增 `RealTlsConnectionTest.refusedAndRetriedAttemptsWithATwoDatagramClientHello`：10 轮，`validated` 为 2，四个 `Incoming` 与被拒客户端的 Initial 密钥、TLS 会话、StableRef 全部回到基线（基线在 cleaner 稳定后取），通过——没有泄漏 |
+  | `FairnessTest.heavyConnectionDoesNotStarveOthers`（p99 608 ms > 250 ms） | 宿主负载：当时 1 分钟 load average 85–125（另有其他任务） | 界限不变（见下） |
+
+  测试侧另一处修正：`KeyLifecycleTest` 的基线原为测试开始时的 `NativeKeys.live`。按过滤器改变测试顺序后（例如先运行 `ConnectionTest`，其中
+  有测试不关闭就丢弃连接，由 cleaner 兜底），前面测试的垃圾会在计数中途被 cleaner 释放，出现"打开的连接不持有密钥"之类的误报（两种模式都
+  有）。改为 `settledNativeKeys()`（GC 并等 cleaner 稳定后取基线，§11.10 的做法），断言不变。
+- **发现并修正的库缺陷：握手完成前取得的服务端连接打不开流**（`neton.quic.Connection` 驱动层）。
+  - 原因：服务端的 `Connecting.into0Rtt()`（quinn 的 0.5-RTT 路径）在首个 Initial 数据报处理后即交出连接。ClientHello 跨多个数据报时（OpenSSL
+    默认的 X25519MLKEM768 混合密钥份额，或很长的 ALPN 列表），客户端的传输参数——包括流数上限——在后面的数据报里才到，此前 `open` 得到
+    `null` 并等待 `StreamEvent.Available`。而应用对端参数（`StreamsState.setParams`）只抬高上限、不产生任何流事件（quinn 0.11.12 相同：
+    `set_params` 不推 `Available`），客户端也不会为初始上限再发 MAX_STREAMS，于是 `openUni` / `openBi` 永远等待。与 TLS 无关：替身配很长的
+    ALPN 列表同样挂住。quinn 的测试不触发它，是因为那里 rustls 的 ClientHello 只占一个数据报。
+  - 修正 ⚖️：proto 层记录"对端参数已应用"（`Connection.peerParamsApplied`，在 `setPeerParams` 置位，含 0-RTT 票据中的缓存参数），驱动层每轮
+    处理后第一次看到它时唤醒两个方向的 `streamBudgetAvailable`。不在 proto 层发 `Available` 事件，以免改变 quinn 测试断言的事件序列。
+  - 回归测试 `HalfRttOpenTest`（服务端 `into0Rtt` 后立即 `openUni` 与 `openBi` 并写入，客户端读到两条流）：替身 + 1000 个 ALPN 协议的
+    ClientHello、真实 TLS 默认密钥份额（两个数据报）——去掉修正时两者都在 15 s 超时，加上后约 100 ms 通过；真实 TLS + X25519（一个数据报）
+    修正前后都通过（对照）。
+- **0-RTT 在真实 TLS 上被干净地拒绝**（本批不支持，但不得崩溃或挂住）：
+  - 跳过方式：kotlin.test 没有运行时跳过，`TestTls.skipOnReal(test, reason)` 在真实 TLS 下打印
+    `SKIPPED on real TLS: <测试>: 0-RTT (session tickets, early data) is not in this batch ...` 后返回（出现在测试输出与 XML 报告的
+    system-out 中）；这 5 个测试（`ConnectionTest` 4 个、`DriverTest.zeroRtt`）因此在 Gradle 的计数中算作通过，下文计数单列。替身下照常运行。
+  - 新增验证：`RealTlsConnectionTest.zeroRttIsDeclinedOnReconnect`（同一客户端配置第二次连接：`has0rtt()` 假、`earlyCrypto()` 为 null、握手前
+    不能开流、`accepted0rtt()` 假、客户端 `earlyDataAccepted()` 为 false、服务端为 null，1-RTT 数据照常，无丢包）；
+    `zeroRttPacketsAtARealServerAreDropped`（在两数据报的 ClientHello 之间与之后注入伪造的 0-RTT 包：服务端没有 0-RTT 密钥，丢弃，握手与关闭
+    照常，服务端事件只有 HandshakeDataReady、Connected）；`RealTlsDriverTest.zeroRttIsDeclinedOnReconnect`（驱动层：第二次连接 `into0Rtt()`
+    返回 null，`await()` 后回显照常）。`DriverTest.zeroRtt` 在真实 TLS 上的超时即上面的库缺陷，不是 0-RTT 本身的问题。
+- **计数（macOS arm64，各 3 次完整运行，`--rerun-tasks`）**：共 605 个（此前 596 + `HalfRttOpenTest` 3 + `RealTlsConnectionTest` 5 +
+  `RealTlsDriverTest` 1）。
+  - 替身（默认）：3 次均 602 通过、3 个与 quinn 一致地忽略。
+  - 真实 TLS：602 通过（其中 5 个为上述打印原因后跳过的 0-RTT 测试，实际执行 597）、3 个忽略；3 次中 2 次全过，1 次 `FairnessTest` 失败
+    （request p99 290 ms > 250 ms；这次运行开始时 1 分钟 load average 65、结束时 112，5 分钟平均 202 → 141）。
+  - `FairnessTest` 各次（heavy 负载下 request p99）：替身 106 / 185 / 151 ms，真实 TLS 207 / 218 / 290 ms；无 heavy 连接的基线 p99 为替身
+    3 / 4 / 30 ms、真实 TLS 7 / 31 / 23 ms；heavy 负载下握手 p50 替身 85 / 133 / 111 ms、真实 TLS 86 / 158 / 150 ms。运行期间宿主 1 分钟
+    load average 在 65–350 之间（本机 10 个逻辑核，另有其他任务）。真实 TLS 的请求延迟略高但同一数量级（3 次样本、负载不同，未再细分
+    原因）；失败只在负载极高时出现，没有发现真实 TLS 特有的问题，界限不变。
+- **仍未完成**：0-RTT（票据、早期数据、是否接受）；服务端 0.5-RTT 数据（§11.9，OpenSSL 的读密钥顺序）；以上只在 macOS 上运行（153 当时供其他
+  任务使用，未在 Linux 上复验本节）。
