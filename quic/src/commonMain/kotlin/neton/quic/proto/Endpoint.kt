@@ -221,18 +221,23 @@ class Endpoint(
         val params = transportParameters(config.transport, locCid, null)
         val tls = config.crypto.startSession(config.version, serverName, params)
 
-        val conn = addConnection(
-            ch,
-            config.version,
-            remoteId,
-            locCid,
-            remoteId,
-            FourTuple(remote, null),
-            now,
-            tls,
-            config.transport,
-            SideArgs.Client(config.tokenStore, serverName),
-        )
+        val conn = try {
+            addConnection(
+                ch,
+                config.version,
+                remoteId,
+                locCid,
+                remoteId,
+                FourTuple(remote, null),
+                now,
+                tls,
+                config.transport,
+                SideArgs.Client(config.tokenStore, serverName),
+            )
+        } catch (t: Throwable) {
+            tls.close() // ⚖️ quinn drops it; the session's native resources are released at once
+            throw t
+        }
         return ch to conn
     }
 
@@ -443,18 +448,23 @@ class Endpoint(
         }
 
         val tls = config.crypto.startSession(version, params)
-        val conn = addConnection(
-            ch,
-            version,
-            dstCid,
-            locCid,
-            srcCid,
-            incoming.addresses,
-            incoming.receivedAt,
-            tls,
-            config.transport,
-            SideArgs.Server(config, prefAddrCid, remoteAddressValidated),
-        )
+        val conn = try {
+            addConnection(
+                ch,
+                version,
+                dstCid,
+                locCid,
+                srcCid,
+                incoming.addresses,
+                incoming.receivedAt,
+                tls,
+                config.transport,
+                SideArgs.Server(config, prefAddrCid, remoteAddressValidated),
+            )
+        } catch (t: Throwable) {
+            tls.close()
+            throw t
+        }
         index.insertInitial(dstCid, ch)
 
         val error = conn.handleFirstPacket(
@@ -473,6 +483,8 @@ class Endpoint(
 
         // handshake failed
         handleEvent(ch, EndpointEvent.Drained)
+        // ⚖️ quinn drops the connection here; its keys and crypto session are released at once
+        conn.releaseDiscarded()
         val response = if (error is ConnectionError.Transport) {
             initialClose(version, incoming.addresses, incoming.crypto, srcCid, error.error, buf)
         } else {

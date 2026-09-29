@@ -2579,6 +2579,7 @@ class Connection internal constructor(
     /**
      * ⚖️ Free every key the connection still holds when it drains (quinn drops them with the connection). The 1-RTT
      * header keys are shared by the current and the retired packet keys, so each key is closed once through its owner.
+     * The crypto session is released too (the release contract of [CryptoSession]).
      */
     private fun releaseKeys() {
         for (space in spaces) {
@@ -2588,7 +2589,14 @@ class Connection internal constructor(
         nextCrypto?.close(); nextCrypto = null
         prevCrypto?.crypto?.close(); prevCrypto = null
         zeroRttCrypto?.close(); zeroRttCrypto = null
+        crypto.close()
     }
+
+    /**
+     * Release the keys and the crypto session of a connection the endpoint discards without draining it (a server
+     * connection whose first packet failed; quinn drops it).
+     */
+    internal fun releaseDiscarded() = releaseKeys()
 
     /** Terminate the connection instantly, without sending a close packet. */
     internal fun kill(reason: ConnectionError) {
