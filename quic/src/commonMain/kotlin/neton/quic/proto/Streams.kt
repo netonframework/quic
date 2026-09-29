@@ -154,6 +154,13 @@ class SendStream internal constructor(
         if (slot < 0) return WriteError.ClosedStream
         val stream = state.getOrInsertSend(slot, maxSendData)
 
+        // ⚖️ quinn checks the connection-level limit first, so a write on a stream the peer stopped reports `Blocked`
+        // while the connection window is full; the stream then waits on the connection-blocked list, which only reports
+        // streams that still have stream-level credit — a stopped stream whose own window is used up never gets more,
+        // so its writer never learns of the stop and waits forever. A stopped or closed stream fails first.
+        if (!stream.isWritable) return WriteError.ClosedStream
+        stream.stopReason?.let { return WriteError.Stopped(it) }
+
         if (limit == 0L) {
             // write blocked by connection-level flow control or send window
             if (!stream.connectionBlocked) {
