@@ -11,7 +11,7 @@ Real TLS works and quinn interop passes in both directions (SPEC §11.9), so the
 complete for this version **except 0-RTT**, which is a separate later batch. Tested on macOS arm64 and Linux x64
 (epoll and io_uring).
 
-What exists (SPEC §11.1–11.9):
+What exists (SPEC §11.1–11.10):
 - varint and frame codecs, and packet protection and header protection on openssl-kotlin primitives;
 - streams, flow control and datagrams;
 - congestion control (NewReno, Cubic, BBR), pacing, RTT estimation, MTU discovery, packet spaces and ACKs;
@@ -26,7 +26,11 @@ What exists (SPEC §11.1–11.9):
 - the driver layer (SPEC §3, §11.8): the endpoint, connection and stream API on neton-io UDP sockets on one reactor,
   with receive and send budgets, the lifecycle rules as explicit `close()`, streams as neton-io `IoStream`;
 - quinn's connection, token and driver tests (the TLS-dependent ones on real TLS; the rest run on either the real
-  session or the test double, `NETON_QUIC_TEST_TLS=real`); 555 tests.
+  session or the test double, `NETON_QUIC_TEST_TLS=real`);
+- verification under an impaired network (SPEC §11.10): seeded loss, reordering, duplication and delay in the
+  protocol-level simulation and through a UDP relay for the real driver — bulk transfer at 1/5/20% loss, lost handshake
+  flights, key updates, resets and stops, closes under loss, exhausted flow-control credit, chaos soaks; two bugs found
+  and fixed (both also in quinn 0.11.12); 596 tests.
 - two-way interop with quinn 0.11 (`interop/quinn-peer`): handshake with certificate verification and ALPN,
   bidirectional stream echo, key updates initiated by each side, application close, and the rejection cases.
 
@@ -35,6 +39,9 @@ What is missing:
   are off.
 - The server sends no 0.5-RTT data: OpenSSL yields the server's 1-RTT read secret only after the client's Finished.
 - Tests have run on macOS arm64 and Linux x64 only; the other targets are compile-checked.
+- The whole suite on real TLS (`NETON_QUIC_TEST_TLS=real`) still has test-side failures to clear: the 0-RTT tests,
+  tests written against the test double's types, and datagram-count tests that assume a one-datagram ClientHello
+  (OpenSSL's default hybrid key share needs two; `groups = "X25519"` needs one).
 - quic-interop-runner and the performance comparison with quinn (SPEC §6).
 
 `quic-testkit` (test-only) holds the TLS test double (`MockTls`) and a test PKI (`TestPki`) that generates
