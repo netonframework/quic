@@ -350,7 +350,7 @@ class TlsSession private constructor(
     /** Whether the native session has been released. */
     val isClosed: Boolean get() = native.isReleased
 
-    override fun initialKeys(dstCid: ConnectionId, side: Side): Keys = initialKeys(version, dstCid, side)
+    override fun initialKeys(dstCid: ConnectionId, side: Side): Keys = neton.quic.proto.initialKeys(version, dstCid, side)
 
     /** A [TlsHandshakeData], once available. */
     override fun handshakeData(): Any? =
@@ -427,7 +427,7 @@ class TlsSession private constructor(
     }
 
     override fun isValidRetry(origDstCid: ConnectionId, header: ByteArray, payload: ByteArray): Boolean =
-        isValidRetry(version, origDstCid, header, payload)
+        neton.quic.proto.isValidRetry(version, origDstCid, header, payload)
 
     override fun exportKeyingMaterial(output: ByteArray, label: ByteArray, context: ByteArray) {
         val s = ssl
