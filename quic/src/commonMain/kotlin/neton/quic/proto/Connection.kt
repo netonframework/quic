@@ -107,6 +107,12 @@ class Connection internal constructor(
     internal var keyPhaseSize: Long
         private set
 
+    /**
+     * ⚖️ The number of the first Data-space packet protected with the current 1-RTT keys (0 for the first phase): a
+     * new key update waits until a packet from here on is acknowledged (RFC 9001 §6.1; quinn does not check this).
+     */
+    private var keyPhaseStart = 0L
+
     /** Transport parameters set by the peer. */
     internal var peerParams: TransportParameters = TransportParameters.default()
         private set
@@ -865,6 +871,12 @@ class Connection internal constructor(
         if (!state.isEstablished) return // ignoring forced key update in illegal state
         // We already just updated, or are currently updating, the keys. Concurrent key updates are illegal.
         if (prevCrypto != null) return
+        // ⚖️ RFC 9001 §6.1: not before a packet sent with the current keys has been acknowledged. quinn only checks
+        // the retained previous keys, which the discard timer drops whether or not the peer has seen the current phase:
+        // a side that adopted the peer's update and whose packets in that phase were all lost could start the next
+        // one, and the peer — still expecting the current phase — would decrypt it with the keys before (it has not
+        // yet seen a packet ending them) and fail every packet until the connection idled out.
+        if (spaces[SpaceId.Data].largestAckedPacket < keyPhaseStart) return
         updateKeys(-1, Instant.NONE, false)
     }
 
@@ -2474,6 +2486,7 @@ class Connection internal constructor(
         spaces[SpaceId.Data].crypto = Keys(current.header, nextCrypto!!)
         nextCrypto = new
         spaces[SpaceId.Data].sentWithKeys = 0
+        keyPhaseStart = spaces[SpaceId.Data].nextPacketNumber
         prevCrypto?.crypto?.close()           // an earlier phase still retained: its keys are retired now
         prevCrypto = PrevCrypto(old, endPacket, endPacketTime, remote)
         keyPhase = !keyPhase
