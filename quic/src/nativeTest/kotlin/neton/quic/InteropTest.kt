@@ -39,11 +39,12 @@ import kotlin.time.Duration.Companion.seconds
  *
  * - `NETON_QUIC_INTEROP=server NETON_QUIC_INTEROP_ADDR=127.0.0.1:4433 NETON_QUIC_INTEROP_CERT=server.pem
  *   NETON_QUIC_INTEROP_KEY=server.key NETON_QUIC_INTEROP_CONNS=1 test.kexe --ktest_filter=neton.quic.InteropTest.*`:
- *   accept that many connections; echo every bidirectional stream, forcing a key update after each; print what was
+ *   accept that many connection attempts (failed handshakes are logged); echo every bidirectional stream, forcing a key update after each; print what was
  *   negotiated and how each connection ended.
  * - `NETON_QUIC_INTEROP=client NETON_QUIC_INTEROP_ADDR=127.0.0.1:4434 NETON_QUIC_INTEROP_NAME=localhost
  *   NETON_QUIC_INTEROP_CA=ca.pem test.kexe --ktest_filter=neton.quic.InteropTest.*`: open streams one after
- *   another, each echoed and compared, forcing a key update between them; close with code 0x42.
+ *   another, each echoed and compared, forcing a key update between them (after a pause, so the server's own update after its echo does not
+ *   swallow it); close with code 0x42.
  *
  * ALPN is `neton-interop`. Certificates are verified against the given CA (no insecure mode).
  */
@@ -97,8 +98,15 @@ class InteropTest {
         val endpoint = Endpoint.create(EndpointConfig.default(), cfg, bindUdp(address(env("NETON_QUIC_INTEROP_ADDR")!!)))
         log("server listening on ${endpoint.localAddr()}")
         val conns = env("NETON_QUIC_INTEROP_CONNS")?.toInt() ?: 1
+        var served = 0
         repeat(conns) { n ->
-            val conn = endpoint.accept()!!.await()
+            val conn = try {
+                endpoint.accept()!!.await()
+            } catch (e: ConnectionError) {
+                log("conn $n: handshake failed: $e")
+                return@repeat
+            }
+            served++
             val hd = conn.handshakeData() as TlsHandshakeData
             log("conn $n: connected from ${conn.remoteAddress()}; ALPN ${hd.protocol?.decodeToString()}; SNI ${hd.serverName}")
             var streams = 0
@@ -120,6 +128,7 @@ class InteropTest {
             assertTrue(inner.keyUpdates - inner.peerKeyUpdates >= 1, "a key update of ours was accepted")
             assertTrue(inner.peerKeyUpdates >= 1, "a key update of the peer was accepted")
         }
+        assertTrue(served > 0, "no connection was served")
         endpoint.waitIdle()
         endpoint.close()
         log("server done")
@@ -145,9 +154,9 @@ class InteropTest {
             writer.join()
             assertContentEquals(msg, back, "stream $i")
             total += back.size
-            conn.forceKeyUpdate()
-            // Let the previous key phase be discarded (3 PTO) so that the next forced update is not skipped
+            // Let a key update the peer made after its echo be discarded (3 PTO) first, so that ours is not skipped
             kotlinx.coroutines.delay(200)
+            conn.forceKeyUpdate()
         }
         val inner = conn.state.inner
         log("client echoed $streams streams, $total bytes; key updates ${inner.keyUpdates} (${inner.peerKeyUpdates} by the peer); lost packets ${conn.stats().path.lostPackets}")
