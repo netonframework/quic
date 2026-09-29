@@ -1,5 +1,5 @@
 //! quinn echo server: `server <listen addr> <cert.pem> <key.pem> [connections]`.
-//! Echoes every bidirectional stream and forces a key update after each echo.
+//! Echoes every bidirectional stream, each echo in a new key phase forced 300 ms after the stream was read.
 
 #[path = "../common.rs"]
 mod common;
@@ -46,10 +46,13 @@ async fn main() -> Result<()> {
             match conn.accept_bi().await {
                 Ok((mut send, mut recv)) => {
                     let data = recv.read_to_end(64 << 20).await?;
+                    // the client's update came with this stream; once it is discarded (3 PTO), update ours and send
+                    // the echo in the new key phase
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    conn.force_key_update();
                     send.write_all(&data).await?;
                     send.finish()?;
                     streams += 1;
-                    conn.force_key_update();
                 }
                 Err(e) => {
                     let s = conn.stats();

@@ -1,5 +1,5 @@
 //! quinn echo client: `client <server addr> <server name> <ca.pem> [streams] [alpn]`.
-//! Opens streams one after another, each echoed and compared, forcing a key update after each (after a pause); closes with 0x42.
+//! Opens streams one after another, each echoed and compared, each in a new key phase forced 300 ms after the previous echo; closes with 0x42.
 //! With a wrong CA or ALPN the connection error is printed and the exit status is 2.
 
 #[path = "../common.rs"]
@@ -60,8 +60,9 @@ async fn main() -> Result<()> {
             bail!("stream {i}: echo differs ({} vs {} bytes)", back.len(), msg.len());
         }
         total += back.len();
-        // let the server's key update after its echo be discarded (3 PTO) first, so this one is not skipped
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // the server's update came with the echo; once it is discarded (3 PTO), update ours and send the next
+        // stream in the new key phase
+        tokio::time::sleep(Duration::from_millis(300)).await;
         conn.force_key_update();
     }
     let s = conn.stats();
