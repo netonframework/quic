@@ -117,6 +117,14 @@ class Connection internal constructor(
     internal var peerParams: TransportParameters = TransportParameters.default()
         private set
 
+    /**
+     * Whether [peerParams] holds the peer's parameters (from the handshake, or remembered with a 0-RTT ticket) rather
+     * than the defaults. Applying them raises the stream limits without a stream event (as in quinn); the driver uses
+     * this to wake streams waiting to be opened before the parameters arrived.
+     */
+    internal var peerParamsApplied: Boolean = false
+        private set
+
     /** Source connection ID of the first packet received from the peer. */
     private var origRemCid: ConnectionId = remCid
 
@@ -2448,6 +2456,7 @@ class Connection internal constructor(
         }
         ackFrequency.peerMaxAckDelay = getMaxAckDelay(params)
         peerParams = params
+        peerParamsApplied = true
         path.mtud.onPeerMaxUdpPayloadSizeReceived(minOf(params.maxUdpPayloadSize.value, 0xFFFFL).toInt())
     }
 

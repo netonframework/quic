@@ -405,6 +405,7 @@ internal class ConnectionState(
 
     /** Notified when new streams may be locally initiated due to an increase in stream ID flow control budget. */
     val streamBudgetAvailable = arrayOf(Notify(), Notify())
+    private var peerStreamLimitsSignaled = false
 
     /** Notified when the peer has initiated a new stream. */
     val streamIncoming = arrayOf(Notify(), Notify())
@@ -479,6 +480,7 @@ internal class ConnectionState(
                 if (driveTimer(delay, context)) keepGoing = true
                 forwardEndpointEvents()
                 forwardAppEvents()
+                signalPeerStreamLimits()
 
                 if (inner.isDrained) break
                 if (keepGoing) yield() else park()
@@ -597,6 +599,21 @@ internal class ConnectionState(
                 }
             }
         }
+    }
+
+    /**
+     * ⚖️ Wake streams waiting to be opened once the peer's transport parameters are applied. A server connection taken
+     * before the handshake completes ([Connecting.into0Rtt]) exists after the first Initial datagram; when the
+     * ClientHello spans more than one datagram (OpenSSL's default hybrid key share, or a long ALPN list), the client's
+     * stream limits arrive later and raise them without a stream event, so an `openUni` / `openBi` issued in between
+     * waited for a MAX_STREAMS that is never sent. quinn 0.11.12 has the same gap; its tests never hit it because the
+     * rustls ClientHello there fits one datagram.
+     */
+    private fun signalPeerStreamLimits() {
+        if (peerStreamLimitsSignaled || !inner.peerParamsApplied) return
+        peerStreamLimitsSignaled = true
+        streamBudgetAvailable[0].notifyWaiters()
+        streamBudgetAvailable[1].notifyWaiters()
     }
 
     private fun signalHandshakeData() {
