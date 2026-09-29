@@ -7,6 +7,7 @@ import kotlin.native.runtime.NativeRuntimeApi
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -339,6 +340,181 @@ class RealTlsConnectionTest {
             chunks.finalize()
             assertEquals(data.size, got, "$suite")
         }
+    }
+
+    // ---- OpenSSL's default two-datagram ClientHello with address validation (SPEC §11.11) ----
+    //
+    // quinn's `validate_then_reject_manually`, `use_token_then_retry` and the refused / retried key-lifecycle test
+    // count `Incoming`s and assume a one-datagram ClientHello; on the harness they run with an X25519-only client.
+    // Here the same scenarios run with OpenSSL's default ClientHello (X25519MLKEM768 + X25519, two Initial datagrams):
+    // every Initial datagram that does not belong to a connection is an `Incoming` of its own, and the harness (like
+    // quinn's) decides on each one as it arrives, so the application is asked once per datagram. The client acts on
+    // the first Retry only (RFC 9000 §17.2.5.2) and on the first CONNECTION_REFUSED.
+
+    private fun twoDatagramHelloClient() = ClientConfig(TestTls.clientCrypto(groups = null))
+
+    private fun ConnPair.beginTwoDatagramConnect(config: ClientConfig = twoDatagramHelloClient()): ConnectionHandle {
+        val clientCh = beginConnect(config)
+        driveClient()
+        assertEquals(2, server.inbound.size, "OpenSSL's default ClientHello spans two Initial datagrams")
+        return clientCh
+    }
+
+    @Test
+    fun validateThenRejectWithATwoDatagramClientHello() {
+        val pair = ConnPair.real()
+        val seen = ArrayList<Boolean>()
+        pair.server.handleIncoming = { incoming ->
+            seen.add(incoming.remoteAddressValidated())
+            if (incoming.remoteAddressValidated()) IncomingConnectionBehavior.Reject else IncomingConnectionBehavior.Retry
+        }
+        val clientCh = pair.beginTwoDatagramConnect()
+        pair.drive()
+        // two Retries for the first ClientHello, the client answers the first; two refusals for the second
+        assertEquals(listOf(false, false, true, true), seen)
+        pair.server.assertNoAccept()
+        val client = pair.clientConn(clientCh)
+        assertTrue(client.isClosed)
+        val lost = client.poll() as Event.ConnectionLost
+        assertEquals(TransportErrorCode.CONNECTION_REFUSED, (lost.reason as ConnectionError.ConnectionClosed).reason.errorCode)
+        pair.drive()
+        assertNull(pair.clientConn(clientCh).poll())
+        assertEquals(0, pair.client.endpoint.knownConnections())
+        assertEquals(0, pair.client.endpoint.knownCids())
+        assertEquals(0, pair.server.endpoint.knownConnections())
+        assertEquals(0, pair.server.endpoint.knownCids())
+    }
+
+    @Test
+    fun useTokenThenRetryWithATwoDatagramClientHello() {
+        val pair = ConnPair.real()
+        val config = twoDatagramHelloClient()
+        run {
+            val (clientCh, _) = pair.connectWith(config.copy())
+            pair.clientConn(clientCh).close(pair.time, VarInt(42), Bytes.EMPTY)
+            pair.drive()
+        }
+        val seen = ArrayList<Pair<Boolean, Boolean>>()
+        pair.server.handleIncoming = { incoming ->
+            seen.add(incoming.remoteAddressValidated() to incoming.mayRetry())
+            if (incoming.mayRetry()) IncomingConnectionBehavior.Retry else IncomingConnectionBehavior.Accept
+        }
+        val clientCh = pair.beginTwoDatagramConnect(config)
+        pair.drive()
+        val serverCh = pair.server.assertAccept()
+        // Both datagrams of the first ClientHello carry the NEW_TOKEN token. The first validates the address and is
+        // retried; the token is then spent, so for the second it is a reuse and does not validate (quinn's token log,
+        // `use_same_token_twice`), and it is retried too. The first datagram of the ClientHello after the Retry
+        // carries the Retry token and is accepted; the second belongs to the new connection.
+        assertEquals(listOf(true to true, false to true, true to false), seen)
+        pair.assertClientConnectedAfterDrive(clientCh)
+        pair.clientConn(clientCh).close(pair.time, VarInt(42), Bytes.EMPTY)
+        pair.drive()
+        assertIs<Event.ConnectionLost>(pair.serverConn(serverCh).drainEvents().last())
+        assertEquals(0, pair.client.endpoint.knownConnections())
+        assertEquals(0, pair.server.endpoint.knownConnections())
+        assertEquals(0, pair.server.endpoint.knownCids())
+    }
+
+    /**
+     * `KeyLifecycleTest.refusedAndRetriedAttemptsReleaseTheirInitialKeys` with the two-datagram ClientHello: the
+     * application is asked about both datagrams of the validated ClientHello (so `validated` is 2, not quinn's 1), and
+     * every Initial key, TLS session and StableRef of the four `Incoming`s and the refused client is released.
+     */
+    @Test
+    fun refusedAndRetriedAttemptsWithATwoDatagramClientHello() {
+        settle()
+        val sessions = NativeTls.liveSessions
+        val refs = NativeTls.liveStableRefs
+        val keys = NativeKeys.live
+        repeat(10) {
+            val pair = ConnPair.real()
+            var validated = 0
+            pair.server.handleIncoming = { incoming ->
+                if (incoming.remoteAddressValidated()) { validated++; IncomingConnectionBehavior.Reject } else IncomingConnectionBehavior.Retry
+            }
+            val clientCh = pair.beginTwoDatagramConnect()
+            pair.drive()
+            assertTrue(pair.clientConn(clientCh).isClosed)
+            pair.drive()
+            assertEquals(2, validated)
+            assertEquals(0, pair.client.endpoint.knownConnections())
+            assertEquals(0, pair.server.endpoint.knownConnections())
+        }
+        assertEquals(sessions, NativeTls.liveSessions, "TLS sessions left after refused / retried attempts")
+        assertEquals(refs, NativeTls.liveStableRefs)
+        assertEquals(keys, NativeKeys.live, "native key contexts left after refused / retried attempts")
+    }
+
+    // ---- 0-RTT is declined cleanly (not in this batch, SPEC §11.9 / §11.11) ----
+
+    /**
+     * A client that connected before connects again with the same configuration: there is no ticket, so no 0-RTT
+     * keys, no early streams, and the second connection is an ordinary full handshake (quinn's `zero_rtt_happypath`
+     * up to the point where it needs a ticket).
+     */
+    @Test
+    fun zeroRttIsDeclinedOnReconnect() {
+        val pair = ConnPair.real()
+        val config = realClient()
+        run {
+            val (clientCh, _) = pair.connectWith(config.copy())
+            pair.clientConn(clientCh).close(pair.time, VarInt(0), Bytes.EMPTY)
+            pair.drive()
+        }
+        pair.client.addr = localhostV6(nextClientPort())
+        val clientCh = pair.beginConnect(config)
+        assertFalse(pair.clientConn(clientCh).has0rtt())
+        assertNull(pair.clientConn(clientCh).cryptoSession().earlyCrypto())
+        // Without 0-RTT the server's stream limits are unknown until the handshake: no early stream.
+        assertNull(pair.clientStreams(clientCh).open(Dir.Uni))
+        pair.drive()
+        val serverCh = pair.server.assertAccept()
+        pair.assertClientConnectedAfterDrive(clientCh)
+        assertFalse(pair.clientConn(clientCh).accepted0rtt())
+        assertEquals(false, pair.clientConn(clientCh).cryptoSession().earlyDataAccepted())
+        assertNull(pair.serverConn(serverCh).cryptoSession().earlyDataAccepted())
+
+        val s = pair.clientStreams(clientCh).open(Dir.Uni)!!
+        val msg = "Hello, 1-RTT!".encodeToByteArray()
+        pair.clientSend(clientCh, s).writeOk(msg)
+        pair.clientSend(clientCh, s).finish()
+        pair.drive()
+        val chunks = pair.serverRecv(serverCh, s).read(false)
+        assertContentEquals(msg, chunks.nextChunk().bytes.toByteArray())
+        chunks.finalize()
+        assertEquals(0L, pair.clientConn(clientCh).stats().path.lostPackets)
+    }
+
+    /**
+     * 0-RTT packets arriving at a real-TLS server (as a client that assumes a ticket would send them) are dropped for
+     * want of 0-RTT keys, before and after the server has handshake keys; the handshake completes normally.
+     */
+    @Test
+    fun zeroRttPacketsAtARealServerAreDropped() {
+        val pair = ConnPair.real()
+        val clientCh = pair.beginTwoDatagramConnect()
+        val first = pair.server.inbound.first()
+        val hello = first.data
+        // Long header: form, fixed bit, type 0-RTT (1), 4-byte packet number; version; DCID; SCID (RFC 9000 §17.2.3)
+        val dcidLen = hello[5].toInt() and 0xff
+        val scidLen = hello[6 + dcidLen].toInt() and 0xff
+        val cids = hello.copyOfRange(5, 7 + dcidLen + scidLen)
+        val payload = ByteArray(200) { (it * 31 + 7).toByte() }
+        val length = 4 + payload.size
+        val forged = byteArrayOf(0xd3.toByte()) + hello.copyOfRange(1, 5) + cids +
+            byteArrayOf((0x40 or (length ushr 8)).toByte(), length.toByte()) + byteArrayOf(0, 0, 0, 1) + payload
+        pair.server.inbound.add(1, first.copy(data = forged))
+        pair.server.inbound.addLast(first.copy(data = forged.copyOf()))
+        pair.drive()
+        val serverCh = pair.server.assertAccept()
+        pair.assertClientConnectedAfterDrive(clientCh)
+        assertEquals(Event.HandshakeDataReady, pair.serverConn(serverCh).poll())
+        assertEquals(Event.Connected, pair.serverConn(serverCh).poll())
+        assertNull(pair.serverConn(serverCh).poll())
+        pair.clientConn(clientCh).close(pair.time, VarInt(0), Bytes.EMPTY)
+        pair.drive()
+        assertIs<Event.ConnectionLost>(pair.serverConn(serverCh).poll())
     }
 
     // ---- native resources back to baseline (SPEC §11.6 standard, extended to the TLS sessions) ----

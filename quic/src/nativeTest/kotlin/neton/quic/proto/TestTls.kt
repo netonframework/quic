@@ -5,6 +5,7 @@ package neton.quic.proto
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.toKString
 import neton.quic.testkit.MockClientCrypto
+import neton.quic.testkit.MockHandshakeData
 import neton.quic.testkit.MockServerCrypto
 import neton.quic.testkit.TestCa
 import neton.quic.testkit.TestIdentity
@@ -56,6 +57,49 @@ internal object TestTls {
     /** The harness default: [kind]'s client crypto. */
     fun defaultClientCrypto(alpn: List<ByteArray> = emptyList()): CryptoClientConfig =
         if (kind == TestTlsKind.Real) clientCrypto(alpn) else MockClientCrypto(alpn = alpn)
+
+    /**
+     * [kind]'s client crypto with a ClientHello that fits one Initial datagram, for quinn tests that count datagrams
+     * or `Incoming`s and so assume one (rustls's ring provider in quinn's tests sends only an X25519 key share).
+     * OpenSSL's default ClientHello also carries an X25519MLKEM768 share and takes two datagrams; on real TLS this
+     * offers X25519 only. The test double's ClientHello is always one datagram. The two-datagram ClientHello is
+     * exercised explicitly in `RealTlsConnectionTest`.
+     */
+    fun oneDatagramHelloClientCrypto(alpn: List<ByteArray> = emptyList()): CryptoClientConfig =
+        if (kind == TestTlsKind.Real) clientCrypto(alpn, groups = "X25519") else MockClientCrypto(alpn = alpn)
+
+    /**
+     * The application protocol in a session's handshake data, whichever TLS layer produced it ([TlsHandshakeData] or
+     * the test double's `MockHandshakeData`; quinn downcasts to rustls's `HandshakeData`).
+     */
+    fun negotiatedProtocol(handshakeData: Any?): ByteArray? = when (handshakeData) {
+        is TlsHandshakeData -> handshakeData.protocol
+        is MockHandshakeData -> handshakeData.protocol
+        else -> throw AssertionError("no handshake data of a known TLS layer: $handshakeData")
+    }
+
+    /** The server name in a server session's handshake data, whichever TLS layer produced it. */
+    fun serverName(handshakeData: Any?): String? = when (handshakeData) {
+        is TlsHandshakeData -> handshakeData.serverName
+        is MockHandshakeData -> handshakeData.serverName
+        else -> throw AssertionError("no handshake data of a known TLS layer: $handshakeData")
+    }
+
+    /**
+     * Skip the calling test when the harness runs on real TLS, printing why (kotlin.test has no runtime skip; the
+     * line appears in the test's output and the XML report's system-out). Returns `true` if the test must return.
+     * Only for behaviour the real session does not provide in this batch (SPEC §11.9 / §11.11), never to hide a
+     * difference that is not understood.
+     */
+    fun skipOnReal(test: String, reason: String): Boolean {
+        if (kind != TestTlsKind.Real) return false
+        println("SKIPPED on real TLS: $test: $reason")
+        return true
+    }
+
+    /** Why the 0-RTT tests do not run on real TLS. */
+    const val NO_ZERO_RTT = "0-RTT (session tickets, early data) is not in this batch of the real TLS session (SPEC §11.9); " +
+        "it declines 0-RTT, which RealTlsConnectionTest / RealTlsDriverTest verify"
 
     /** A self-signed certificate with many names, too big for the first flight's amplification limit (quinn `big_cert_and_key`). */
     val bigSelfSigned: TestIdentity by lazy { TestPki.selfSigned(listOf("localhost") + (0 until 1000).map { "foo_$it" }) }

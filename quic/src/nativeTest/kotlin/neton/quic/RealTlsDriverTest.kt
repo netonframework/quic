@@ -28,6 +28,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 
@@ -120,6 +121,43 @@ class RealTlsDriverTest {
         settle()
         assertEquals(sessions, NativeTls.liveSessions, "TLS sessions left after the endpoints closed")
         assertEquals(keys, NativeKeys.live, "keys left after the endpoints closed")
+    }
+
+    /**
+     * 0-RTT is not in this batch (SPEC §11.9): a client connecting again after a completed connection has no ticket,
+     * so `into0Rtt` declines and hands the `Connecting` back unchanged, and the full handshake carries the data
+     * (quinn's `zero_rtt` up to the point where it needs a ticket; that test skips on real TLS).
+     */
+    @Test
+    fun zeroRttIsDeclinedOnReconnect() = quicTest {
+        val server = server()
+        val client = client()
+        val serverTask = launch {
+            repeat(2) {
+                val conn = assertNotNull(server.accept()).await()
+                launch {
+                    val (send, recv) = conn.acceptBi()
+                    send.writeAll(recv.readToEnd())
+                    send.finish()
+                    conn.closed()
+                }
+            }
+        }
+        repeat(2) { round ->
+            val connecting = client.connect(server.localAddr(), "localhost")
+            assertNull(connecting.into0Rtt(), "round $round: 0-RTT without a ticket")
+            val conn = connecting.await()
+            val (send, recv) = conn.openBi()
+            val msg = "round $round".encodeToByteArray()
+            send.writeAll(msg)
+            send.finish()
+            assertContentEquals(msg, recv.readToEnd())
+            conn.close(VarInt(0), ByteArray(0))
+        }
+        serverTask.join()
+        client.waitIdle()
+        client.close()
+        server.shutdown()
     }
 
     @Test

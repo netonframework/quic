@@ -399,6 +399,9 @@ internal fun serverConfigWithAlpn(vararg alpn: String): ServerConfig =
 
 internal fun clientConfig(crypto: CryptoClientConfig = TestTls.defaultClientCrypto()): ClientConfig = ClientConfig(crypto)
 
+/** The harness's client with a one-datagram ClientHello (`TestTls.oneDatagramHelloClientCrypto`). */
+internal fun oneDatagramHelloClientConfig(): ClientConfig = ClientConfig(TestTls.oneDatagramHelloClientCrypto())
+
 internal fun clientConfigWithAlpn(vararg alpn: String): ClientConfig =
     clientConfig(TestTls.defaultClientCrypto(alpn.map { it.encodeToByteArray() }))
 

@@ -114,7 +114,10 @@ class TokenPairTest {
     @Test
     fun useTokenThenRetry() {
         val pair = ConnPair.default()
-        val clientConfig = clientConfig()
+        // quinn's sequence of `Incoming`s assumes a one-datagram ClientHello (each Initial datagram without a known
+        // connection is an `Incoming` of its own); the two-datagram case is
+        // `RealTlsConnectionTest.useTokenThenRetryWithATwoDatagramClientHello`.
+        val clientConfig = oneDatagramHelloClientConfig()
         pair.connectAndClose(clientConfig.copy())
 
         var i = 0

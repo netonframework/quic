@@ -16,6 +16,7 @@ import neton.quic.proto.EndpointConfig
 import neton.quic.proto.default
 import neton.quic.proto.IdleTimeout
 import neton.quic.proto.RandomConnectionIdGenerator
+import neton.quic.proto.TestTls
 import neton.quic.proto.TransportConfig
 import neton.quic.proto.VarInt
 import kotlin.test.Ignore
@@ -154,7 +155,12 @@ class DriverTest {
     }
 
     @Test
-    fun zeroRtt() = quicTest {
+    fun zeroRtt() {
+        if (TestTls.skipOnReal("DriverTest.zeroRtt", TestTls.NO_ZERO_RTT)) return
+        zeroRttOnTheTestDouble()
+    }
+
+    private fun zeroRttOnTheTestDouble() = quicTest {
         val endpoint = endpoint()
         val msg0 = "zero".encodeToByteArray()
         val msg1 = "one".encodeToByteArray()

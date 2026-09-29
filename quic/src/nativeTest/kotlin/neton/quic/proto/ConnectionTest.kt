@@ -19,8 +19,9 @@ import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 // quinn-proto `tests/mod.rs`, part 1: handshake, lifecycle, version negotiation, stateless resets, 0-RTT, ALPN,
-// closing, idle timeout, migration and connection IDs. The TLS layer is the test double of `MockTls.kt` (SPEC §4);
-// tests that need real TLS behaviour are listed in the SPEC record, not ported.
+// closing, idle timeout, migration and connection IDs. The TLS layer is the harness's (`TestTls.kind`: the test double
+// of `MockTls.kt` unless `NETON_QUIC_TEST_TLS=real`); tests that need real TLS behaviour are in `RealTlsConnectionTest`,
+// the 0-RTT tests skip on real TLS (SPEC §11.11).
 
 private fun bytes(s: String): Bytes = Bytes.wrap(s.encodeToByteArray())
 
@@ -251,6 +252,7 @@ class ConnectionTest {
     // mod.rs:605
     @Test
     fun zeroRttHappypath() {
+        if (TestTls.skipOnReal("ConnectionTest.zeroRttHappypath", TestTls.NO_ZERO_RTT)) return
         val pair = ConnPair.default()
         pair.server.handleIncoming = ::validateIncoming
         val config = clientConfig()
@@ -290,6 +292,7 @@ class ConnectionTest {
     // mod.rs:671
     @Test
     fun zeroRttRejection() {
+        if (TestTls.skipOnReal("ConnectionTest.zeroRttRejection", TestTls.NO_ZERO_RTT)) return
         val pair = ConnPair.new(EndpointConfig.default(), serverConfigWithAlpn("foo", "bar"))
         val clientCrypto = MockClientCrypto(alpn = listOf("foo".encodeToByteArray()))
 
@@ -405,14 +408,20 @@ class ConnectionTest {
 
     // mod.rs:854
     @Test
-    fun zeroRttIncomingBufferSize() = testZeroRttIncomingLimit { it.incomingBufferSize(4000) }
+    fun zeroRttIncomingBufferSize() {
+        if (TestTls.skipOnReal("ConnectionTest.zeroRttIncomingBufferSize", TestTls.NO_ZERO_RTT)) return
+        testZeroRttIncomingLimit { it.incomingBufferSize(4000) }
+    }
 
     // mod.rs:861
     @Test
-    fun zeroRttIncomingBufferSizeTotal() = testZeroRttIncomingLimit { it.incomingBufferSizeTotal(4000) }
+    fun zeroRttIncomingBufferSizeTotal() {
+        if (TestTls.skipOnReal("ConnectionTest.zeroRttIncomingBufferSizeTotal", TestTls.NO_ZERO_RTT)) return
+        testZeroRttIncomingLimit { it.incomingBufferSizeTotal(4000) }
+    }
 
-    // mod.rs:868. With the mock TLS layer this checks that the negotiated protocol reaches the application through
-    // the session's handshake data; ALPN itself is verified with real TLS (SPEC §4).
+    // mod.rs:868, on the harness's TLS layer: the negotiated protocol reaches the application through the session's
+    // handshake data (read through a TLS-neutral accessor; quinn downcasts to rustls's `HandshakeData`).
     @Test
     fun alpnSuccess() {
         val pair = ConnPair.new(EndpointConfig.default(), serverConfigWithAlpn("foo", "bar", "baz"))
@@ -422,8 +431,8 @@ class ConnectionTest {
         assertEquals(Event.HandshakeDataReady, pair.serverConn(serverCh).poll())
         assertEquals(Event.Connected, pair.serverConn(serverCh).poll())
 
-        val hd = pair.clientConn(clientCh).cryptoSession().handshakeData() as MockHandshakeData
-        assertContentEquals("bar".encodeToByteArray(), hd.protocol)
+        val hd = pair.clientConn(clientCh).cryptoSession().handshakeData()
+        assertContentEquals("bar".encodeToByteArray(), TestTls.negotiatedProtocol(hd))
     }
 
     // mod.rs:1470
@@ -709,15 +718,27 @@ class ConnectionTest {
         assertEquals(Event.Connected, pair.serverConn(serverCh).poll())
     }
 
-    /** A server identity that cannot fit inside the initial anti-amplification limit (quinn `big_cert_and_key`). */
-    private fun bigIdentityServerConfig(): ServerConfig = serverConfig(MockServerCrypto(identity = ByteArray(10_000) { it.toByte() }))
+    /**
+     * A server identity that cannot fit inside the initial anti-amplification limit (quinn `big_cert_and_key`) and a
+     * client that trusts it, both of the harness's TLS layer: on real TLS a self-signed certificate with 1000 names,
+     * and a client with a one-datagram ClientHello as in quinn's test (the default two-datagram ClientHello is
+     * `RealTlsConnectionTest.serverCanSend3InitalPackets`).
+     */
+    private fun bigIdentityPair(): Pair<ConnPair, ClientConfig> = if (TestTls.kind == TestTlsKind.Real) {
+        val big = TestTls.bigSelfSigned
+        ConnPair.new(EndpointConfig.default(), serverConfig(TestTls.serverCrypto(identity = big))) to
+            ClientConfig(TestTls.clientCrypto(trust = big.certificates, groups = "X25519"))
+    } else {
+        ConnPair.new(EndpointConfig.default(), serverConfig(MockServerCrypto(identity = ByteArray(10_000) { it.toByte() }))) to
+            clientConfig()
+    }
 
     /** Ensures that the client sends an anti-deadlock probe after an incomplete server's first flight (mod.rs:2733). */
     @Test
     fun handshakeAntiDeadlockProbe() {
-        val pair = ConnPair.new(EndpointConfig.default(), bigIdentityServerConfig())
+        val (pair, client) = bigIdentityPair()
 
-        val clientCh = pair.beginConnect(clientConfig())
+        val clientCh = pair.beginConnect(client)
         // Client sends initial
         pair.driveClient()
         // Server sends first flight, gets blocked on anti-amplification
@@ -737,9 +758,9 @@ class ConnectionTest {
      */
     @Test
     fun serverCanSend3InitalPackets() {
-        val pair = ConnPair.new(EndpointConfig.default(), bigIdentityServerConfig())
+        val (pair, client) = bigIdentityPair()
 
-        val clientCh = pair.beginConnect(clientConfig())
+        val clientCh = pair.beginConnect(client)
         // Client sends initial
         pair.driveClient()
         // Server sends first flight, gets blocked on anti-amplification
@@ -825,8 +846,10 @@ class ConnectionTest {
             }
         }
 
-        // The server should now retry and reject incoming connections.
-        val clientCh = pair.beginConnect(clientConfig())
+        // The server should now retry and reject incoming connections. Each Initial datagram without a known
+        // connection is an `Incoming` of its own; quinn's count assumes a one-datagram ClientHello (the two-datagram
+        // case is `RealTlsConnectionTest.validateThenRejectWithATwoDatagramClientHello`).
+        val clientCh = pair.beginConnect(oneDatagramHelloClientConfig())
         pair.drive()
         pair.server.assertNoAccept()
         val client = pair.clientConn(clientCh)
