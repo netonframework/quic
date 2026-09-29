@@ -151,6 +151,12 @@ class Secrets(
     fun nextPacketKeys(): KeyPair<PacketKey> =
         KeyPair(packetKey(suite, local), packetKey(suite, remote)).also { update() }
 
+    /** Overwrite the secrets (when the TLS session holding them is released). */
+    internal fun wipe() {
+        Crypto.wipe(client)
+        Crypto.wipe(server)
+    }
+
     /** Derive the next generation of secrets with "quic ku" (rustls `Secrets::update`; RFC 9001 §6.1). */
     fun update() {
         val nextClient = expandLabel(suite.hash, client, LABEL_KU, client.size)

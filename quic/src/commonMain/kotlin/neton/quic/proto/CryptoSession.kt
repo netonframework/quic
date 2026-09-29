@@ -12,8 +12,24 @@ import neton.io.bytes.Bytes
 // `ClientConfig` / `ServerConfig`. Rust's `Result`s are thrown exceptions ([TransportError], [UnsupportedVersion],
 // [ConnectError], [ExportKeyingMaterialError]).
 
-/** A cryptographic session, commonly TLS (quinn `crypto::Session`, crypto.rs:28). */
-interface CryptoSession {
+/**
+ * A cryptographic session, commonly TLS (quinn `crypto::Session`, crypto.rs:28).
+ *
+ * **Release contract** (⚖️ quinn drops the session with the connection; SPEC §11.6 / §11.9): an implementation may
+ * hold native resources (the real TLS session holds an OpenSSL SSL, the StableRef its callbacks get, native buffers
+ * and secrets). The connection owns its session exclusively and calls [close] exactly when it no longer drives it:
+ * when it drains (every path to the Drained state), and when the endpoint discards it without draining (a server
+ * connection whose first packet failed). The endpoint closes a session it started but could not hand to a
+ * connection. [close] must be idempotent and must free the native resources at once (a GC cleaner may back it up,
+ * never replace it); afterwards no callback may run into Kotlin. After [close], [handshakeData], [peerIdentity] and
+ * [transportParameters] keep answering what was known; [readHandshake] throws, [writeHandshake] and [next1rttKeys]
+ * return `null`, and [exportKeyingMaterial] may throw [ExportKeyingMaterialError]. Keys already handed out are owned
+ * by the connection and are not affected.
+ */
+interface CryptoSession : AutoCloseable {
+    /** Release the session's native resources (see the release contract above). Idempotent. */
+    override fun close() {}
+
     /** Create the initial set of keys given the client's initial destination connection ID. */
     fun initialKeys(dstCid: ConnectionId, side: Side): Keys
 
