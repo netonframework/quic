@@ -95,6 +95,14 @@ class Connection internal constructor(
     internal var keyPhase = false
         private set
 
+    /** Key phase changes so far, initiated by either side (for tests; quinn traces "executing key update"). */
+    internal var keyUpdates = 0L
+        private set
+
+    /** Of [keyUpdates], those the peer initiated. */
+    internal var peerKeyUpdates = 0L
+        private set
+
     /** How many packets are in the current key phase. Used only for the Data space. */
     internal var keyPhaseSize: Long
         private set
@@ -2469,6 +2477,8 @@ class Connection internal constructor(
         prevCrypto?.crypto?.close()           // an earlier phase still retained: its keys are retired now
         prevCrypto = PrevCrypto(old, endPacket, endPacketTime, remote)
         keyPhase = !keyPhase
+        keyUpdates++
+        if (remote) peerKeyUpdates++
     }
 
     private fun peerSupportsAckFrequency(): Boolean = peerParams.minAckDelay != null
