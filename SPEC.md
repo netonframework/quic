@@ -23,7 +23,7 @@
   - 客户端不迁移到服务端的首选地址，只保存该地址的连接 ID。
   - 握手期间到达的短头包直接丢弃，不缓存（代码中有 TODO）。
 - **不在本库**：
-  - TLS 1.3 本身（§4 列出本库对它的要求，实现方式待决）。
+  - TLS 1.3 协议本身：由 OpenSSL 4.0.2（经 `com.netonstream:openssl` 的原始绑定）完成；本库实现 QUIC 所需的 TLS 会话层（§4、§11.9）。
   - UDP 系统调用层：由 neton-io 数据报层提供（§9）。
   - HTTP/3：在 `http` 仓库的 `neton.http.h3`，建在本库之上。
 
@@ -310,7 +310,7 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   - Kotlin 没有 Drop，本库改为显式的 `close()`（`AutoCloseable`），并依靠结构化并发：连接的作用域结束时，按上述规则收尾；未显式处置的 `Incoming` 在端点关闭时被拒绝。
   - 每条规则都有对应测试。
 
-## 4. TLS 1.3 的 QUIC 接口（依赖，实现方式待决）
+## 4. TLS 1.3 的 QUIC 接口（已决定：本库在 openssl-kotlin 的原始绑定上实现，§11.9）
 
 参考实现的加密抽象（`$R/quinn-proto/src/crypto.rs`）与 rustls 集成（`crypto/rustls.rs`）决定了 TLS 层必须提供的能力：
 1. 只支持 TLS 1.3；握手字节按加密阶段（Initial / Handshake / 1-RTT）经 CRYPTO 流输入输出。
@@ -325,6 +325,12 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 10. HMAC-SHA256、HKDF-SHA256、AES-256-GCM（令牌与重置密钥）。
 11. 固定的 AES-128-GCM Retry 完整性标签。
 12. Initial 套件为 TLS13_AES_128_GCM_SHA256。
+
+**决定（2026-09-29，所有者决定）**：QUIC 的 TLS 会话在**本库**实现，直接使用 openssl-kotlin（`com.netonstream:openssl` 4.0.2）的
+**原始绑定**（包 `neton.openssl.c`，完整 OpenSSL 头文件的 cinterop）调用 OpenSSL 的第三方 QUIC TLS 接口（`SSL_set_quic_tls_cbs`、
+`SSL_set_quic_tls_transport_params`、`SSL_set_quic_tls_early_data_enabled`）。§11.7 第一批原本请 openssl-kotlin 提供的安全门面
+（按级别的 CRYPTO 输入输出、各级别秘密、ALPN、传输参数原始字节、证书验证、告警映射，以及输入缓冲生命周期、输出上限、C 边界异常、
+关闭后无悬空回调等契约）改由本库实现，契约不变，逐条在 §11.9 记录实现方式与测试。openssl-kotlin 不作修改；§11.7 的请求不再阻塞本库。
 
 **TLS 的来源（2026-09-27 用户确定）**：由另外封装的 `openssl-kotlin` 库提供（基于 OpenSSL 4.0.2），本库不自行实现 TLS，也不在此之前推进依赖 TLS 的部分。
 本库先完成与 TLS 无关的全部工作；`openssl-kotlin` 可用后，按下面的可行性验证清单确认它提供 §4 的 12 项能力（OpenSSL 的第三方 QUIC TLS 接口
@@ -625,3 +631,93 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   32 次未挂起的写入后 `yield` 一次，因阻塞挂起时清零。回归测试 `WriteCoopTest`：6 字节小写循环，对端收到首批字节即停止；去掉修复时写满
   1,249,998 字节才停止，修复后远低于 256 KiB。macOS 与 153 两种驱动各 491 个测试全过。
 
+### 11.9 真实 TLS 会话（OpenSSL 第三方 QUIC TLS 接口，2026-09-29）
+- **决定**（§4，所有者决定 2026-09-29）：TLS 会话在本库实现，建在 openssl-kotlin 4.0.2 的原始绑定（`neton.openssl.c`）上；§11.7 第一批
+  请求的安全门面由本库按同样的契约实现，openssl-kotlin 未作任何修改。
+- **代码**（`nativeMain`，包 `neton.quic.proto`）：`TlsSession`（quinn `crypto::rustls::TlsSession`）、`TlsClientConfig` /
+  `TlsServerConfig`（quinn `QuicClientConfig` / `QuicServerConfig` 与 `with_root_certificates` / `with_single_cert`）、`Certificates`
+  （DER / PEM）、`PrivateKey`（DER / PEM，拒绝加密私钥而不是提示输入口令）、`ClientAuth`（`None` / `Request` / `Require`）、
+  `TlsHandshakeData`、`NativeTls`（原生对象计数与错误队列清理）；`SSL_ctrl` 的 C `long` 在各目标宽度不同，SNI 设置放在
+  `appleMain` / `linuxMain` / `androidNativeMain` / `mingwMain` 的 `actual` 中。`CryptoSession` 新增 `close()` 与释放契约的 KDoc。
+- **状态机（对照 quinn `crypto/rustls.rs`）**：
+  - `readHandshake`：字节入队，驱动 `SSL_do_handshake`（握手完成后为 0 字节的 `SSL_read`，处理 NewSessionTicket 等握手后消息）直到 OpenSSL
+    要求更多输入；"握手数据可用"沿用 quinn 对 rustls 的判定（ALPN 已定、服务端见到 SNI、或握手结束），只在第一次返回 `true`。
+  - `writeHandshake`：先交出连接当前所在级别的字节，再在下一级别的读、写两个秘密都已产出时交出该级别的 `Keys`（rustls `write_hs` 的
+    `KeyChange`）。发送字节按 OpenSSL 当时的写级别分级缓存，因此两个方向秘密的产出顺序不影响结果。
+  - ⚖️ OpenSSL 为 QUIC 先设写密钥后设读密钥：服务端的 1-RTT 读秘密在收到客户端 Finished 之后才产出，所以服务端在那时才得到 1-RTT 密钥
+    （rustls 在服务端发完首个飞行后即给出），服务端不发送 0.5-RTT 数据。quinn 的状态机两种顺序都能处理（HANDSHAKE_DONE 排在密钥之后），
+    内存测试中逐级断言了两端的顺序。
+  - 密钥：握手 / 1-RTT 的包与头部密钥由产出的秘密经已有的 `Secrets`（`expandLabel` / `packetKey` / `headerKey`）按协商的套件派生
+    （AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305；CCM 不开放，同 rustls）；Initial 密钥与 Retry 标签不变；`next1rttKeys` 用应用秘密的
+    "quic ku"，与 quinn 相同。套件由 `SSL_get_pending_cipher` 的协议号确定，秘密长度与套件哈希长度不符即失败。
+  - 错误：告警 → CRYPTO_ERROR 0x100 + alert；没有告警的失败 → PROTOCOL_VIOLATION（同 quinn）；回调记录的失败优先（见下）。失败后会话
+    保持失败状态，再次调用抛同一个错误。客户端提供了 ALPN 而服务端未选 → no_application_protocol（120），同 rustls 的 QUIC 规则；
+    服务端有 ALPN 而客户端未提供（ClientHello 回调）或无共同协议（ALPN 选择回调）→ 120。
+  - 0-RTT 不在本批：`earlyCrypto()` 为 `null`，`earlyDataAccepted()` 客户端为 `false`、服务端为 `null`；票据、会话恢复与早期数据均关闭
+    （`SSL_OP_NO_TICKET`、`num_tickets = 0`、`max_early_data = 0`、`SSL_set_quic_tls_early_data_enabled(0)`）。
+- **契约与测试**（`TlsSessionTest` 为两个会话在内存中直接对话，不经 QUIC）：
+
+  | 契约 | 实现 | 测试 |
+  |---|---|---|
+  | C 边界：`staticCFunction` + StableRef，异常不穿过 C | 六个 QUIC TLS 回调与 ALPN 选择、ClientHello 两个 SSL_CTX 回调都经同一个 `callback` 包装：捕获全部 `Throwable`，记录第一个失败并返回 0（或对应的告警），OpenSSL 调用返回后抛出（非 `TransportError` 转为 INTERNAL_ERROR，保留原消息）；已释放的会话拒绝执行 | `aFailingCallbackNeitherCrashesNorLeaks`：对 8 个回调逐一注入异常，进程不崩溃，得到带注入消息的 INTERNAL_ERROR，SSL / StableRef 计数回到基线 |
+  | 记录缓冲在 RELEASE_RCD 之前有效且不变 | CRYPTO_RECV_RCD 交出的是原生副本（至多 16 KiB，一次只有一个），RELEASE_RCD 释放；部分释放时其余部分保持不动 | `recordStaysPinnedUntilReleasedAndQueuesAreBounded`（直接驱动回调核心：新数据到达不改动已交出的记录、第二个记录被拒、部分释放、越界释放被拒） |
+  | 有界队列 | 收到而 OpenSSL 未取的 CRYPTO 字节每级别至多 64 KiB，超出 → CRYPTO_BUFFER_EXCEEDED；读级别切换时仍有未取字节 → unexpected_message（10）；待 `writeHandshake` 取走的发送字节至多 1 MiB，超出 → INTERNAL_ERROR（连接每次调用后都取走，只有异常的自身证书链可能触及） | `tooMuchUntakenCryptoDataIsCryptoBufferExceeded`、`dataAfterAKeyChangeIsUnexpectedMessage`、上一项 |
+  | 传输参数字节被复制 | 对端参数在回调中复制；本端参数复制进原生内存，保留到 SSL 释放之后（OpenSSL 持有该指针直到发送） | `transportParametersAreExchangedAsRawBytes`、`serverKnowsClientParametersAfterClientHello` |
+  | 所有权与释放 | 会话独占 SSL、StableRef 与原生缓冲；`close()` 恰好一次（与 cleaner 共用一次比较交换）：先标记核心已释放，再 `SSL_free`（此后不可能再有回调），再 dispose StableRef，再释放缓冲并擦除秘密；创建途中任何失败都走同一释放；配置独占一个 SSL_CTX 引用，`close()` 释放，每个 SSL 持有自己的引用（OpenSSL 计数），所以配置关闭后已开始的会话照常工作；关闭的配置不能再开始会话 | `closeReleasesExactlyOnceAndIsIdempotent`、`manyHandshakesSucceedingAndFailingReturnToBaseline`（30 轮，其中三分之二失败，每轮在握手前关闭配置）、`aClosedConfigurationStartsNoSession`、`invalidServerNameIsAConnectError`（SSL 已建后的失败也回到基线）、`theCleanerIsOnlyABackstopForSessions` |
+  | 接入连接的释放点（§11.6） | `Connection.releaseKeys()`（进入 Drained 的所有路径）同时关闭会话；端点丢弃首包失败的服务端连接时释放其密钥与会话（此前该路径的 Initial 密钥也未释放，一并修正）；`connect` / `accept` 中会话已开始但连接未建成时关闭会话 | `RealTlsConnectionTest.manyConnectionsWithKeyUpdatesReleaseSessionsAndKeys`（20 轮建连 + 3 次交替密钥更新 + 关闭）、`failedHandshakesReleaseSessionsAndKeys`（ALPN 不符、缺客户端证书、不受信任的服务端证书、客户端无 ALPN）、`RealTlsDriverTest.manyConnectCloseCyclesReturnToBaseline`（40 次 UDP 建连 / 关闭）、`echoManyStreamsWithKeyUpdatesAndClose`：SSL、StableRef、原生密钥均回到基线 |
+  | 证书验证 | 客户端必须显式给出信任锚（PEM / DER），没有隐式的系统信任库；DNS 名以 `SSL_set1_dnsname`（禁止部分通配、不看 CN）验证并作为 SNI 发送，IP 地址以 `SSL_set1_ipaddr` 验证 IP SAN、不发 SNI；非法名 → `ConnectError.InvalidServerName` | `untrustedCaIsUnknownCa`（48）、`selfSignedServerNotTrustedIsUnknownCa`（48）、`hostnameMismatchFailsVerification`（42）、`expiredServerCertificate`（45）、`ipAddressServerNamesUseIpSans`、`trustedSelfSignedServer`、`peerIdentityIsTheServerChain` |
+  | 客户端认证 | `ClientAuth.Request` / `Require` 以给定 CA 验证；缺证书为 certificate_required（116） | `clientAuthRequiredAndPresented`、`clientAuthRequiredButMissingIsCertificateRequired`、`clientAuthRequestedIsOptional`、`clientCertificateFromAnotherCaIsRejected`（48） |
+  | 无不安全默认 | 只有 TLS 1.3；只有三个 QUIC 套件；无信任锚的客户端只能用 `TlsClientConfig.dangerousNoServerVerificationForTestsOnly(...)`（KDoc 注明不得用于生产） | `clientWithoutTrustAnchorsNeedsTheLoudTestOnlyMode` |
+  | 错误队列隔离 | 每次 OpenSSL 调用前清空本线程的错误队列，调用后取尽并清空，错误只进入本次调用的异常消息 | `staleOpenSslErrorsDoNotLeakIntoAHandshake`（预先塞入无关错误，握手照常成功；失败的握手之后队列为空） |
+  | 密钥、导出器、套件 | 见上 | `fullHandshakeLevelsAndKeysInOrder`（两端各为 Initial 字节 → 握手密钥 → 握手字节 → 1-RTT 密钥，握手与 1-RTT 的包 / 头部密钥双向一致）、`next1rttKeysAgreeAcrossUpdates`、`exporterMatchesOnBothSides`（含超长输出被拒）、`exporterFailsBeforeTheHandshakeAndAfterClose`、`eachCipherSuite`、`alpnServerPreferenceAndHandshakeData`、`alpnMismatchIsNoApplicationProtocol`、`alpnOnlyOnOneSideIsNoApplicationProtocol`、`largeClientHelloAndLargeCertificate`、`garbageIsATlsAlert`、`afterAFailureTheSessionKeepsFailing` |
+
+- **quinn 的测试在真实 TLS 上**（`RealTlsConnectionTest`，经 `PairUtil` 的双端模拟，22 个）：此前等待真实 TLS 的 `reject_self_signed_server_cert`
+  （UnknownCA 0x130）、`reject_missing_client_cert`（客户端先 Connected，随即收到 0x174）、`server_alpn_unset`、`client_alpn_unset`、`alpn_mismatch`
+  （均为 0x178）全部通过；复验 `alpn_success`、`lifecycle`、`draft_version_compat`、`export_keying_material`、`key_update_simple`、
+  `key_update_reordered`、`large_initial`、`handshake_anti_deadlock_probe`、`server_can_send_3_inital_packets`，另加双方交替 12 次密钥更新、
+  Retry 后握手、每个套件传 100 KB、`X25519` 下 ClientHello 为一个数据报、验证过的客户端证书。
+  - ⚖️ OpenSSL 默认的 ClientHello 带 X25519MLKEM768（后量子混合）与 X25519 两个密钥份额，约 1.5 KB，占两个 Initial 数据报（quinn 测试中
+    rustls 的 ring 提供者只发 X25519，一个数据报）。`server_can_send_3_inital_packets` 因此断言服务端首个飞行为客户端数据报数的 3 倍
+    （6 个）。配置新增 `groups`（OpenSSL 的列表语法），默认保留 OpenSSL 的选择。
+- **测试框架的切换**：`TestTls`（`nativeTest`）在进程内生成测试 CA（`quic-testkit` 的 `TestPki`：OpenSSL X509 API、ECDSA P-256，仅测试产物）
+  及其签发的 localhost / 127.0.0.1 / ::1 服务端证书；`PairUtil` 与 `DriverTestUtil` 的默认配置按 `NETON_QUIC_TEST_TLS`（默认 mock，`real`
+  为真实 TLS）选择，专门的真实 TLS 测试显式使用真实会话。整个套件以 `real` 运行（macOS）：555 个中 541 通过、3 个跳过、11 个失败，均已
+  逐一归因：0-RTT 5 个（本批不含）；替身专用 3 个（`alpnSuccess` 强转 `MockHandshakeData`，另两个用 `MockServerCrypto` 的大证书服务端配默认
+  客户端，真实版本在 `RealTlsConnectionTest`）；ClientHello 占两个数据报导致按 `Incoming` 计数的 3 个（`validateThenRejectManually`、
+  `refusedAndRetriedAttemptsReleaseTheirInitialKeys`、`useTokenThenRetry`，以 `NETON_QUIC_TEST_TLS_GROUPS=X25519` 运行即通过）。
+- **驱动层端到端**（`RealTlsDriverTest`，回环 UDP，6 个）：32 条双向流各约 48 KiB 的回显、期间强制 4 次密钥更新、之后再传一条流、以 7 关闭
+  并由服务端看到 ApplicationClosed(7)；以 IP 地址连接；不受信任的服务端 → Transport(0x130)；ALPN 不符 → ConnectionClosed(0x178)；
+  客户端认证；40 次建连 / 关闭后原生对象回到基线。
+- **与 quinn 双向互通**（quinn 0.11.12 / quinn-proto 0.11.18，rustls 0.23 ring 提供者，TLS 1.3，ALPN `neton-interop`；证书由 openssl 命令
+  行生成的一次性测试 CA 签发，双方显式信任该 CA）。quinn 端源码与脚本在 `interop/quinn-peer`（`gen-certs.sh`、`run-interop.sh`，在 153 上
+  位于 `/root/bench/quic-interop/`）；本库一端是 `InteropTest`（`NETON_QUIC_INTEROP=server|client`，未设置时不执行，不进入生产产物）。
+  每条流回显后服务端强制一次密钥更新，客户端在停顿 200 ms（等上一阶段按 3 PTO 丢弃）后再强制一次；quinn 端以
+  `RUST_LOG=quinn_proto::connection=trace` 统计 "executing key update"，本库端统计密钥阶段切换（区分对端发起）。
+  - 命令（153 与本机相同）：`cd /root/bench/quic-interop && ./gen-certs.sh && cargo build --release &&
+    ./run-interop.sh /root/pulsekit/quic-tls/quic/build/bin/linuxX64/debugTest/test.kexe 24433`。
+  - 结果：见下表（macOS 本机与 153 各一次）。
+
+  | 情形 | macOS arm64（本机） | 153 Linux x64（Rocky 9.8，epoll 驱动） |
+  |---|---|---|
+  | 1. 本库客户端 → quinn 服务端：8 条流共 827,916 字节回显一致，以 0x42 关闭 | 通过；本库 16 次密钥阶段切换（8 次由 quinn 发起），quinn 记录 16 次；丢包 0；quinn 看到 "closed by peer: done (code 66)" | 通过；16 次（8 次由 quinn 发起），quinn 16 次；丢包 0；quinn 看到 code 66 关闭 |
+  | 2. quinn 客户端 → 本库服务端：同上 | 通过；本库 15 次（8 次由 quinn 发起），quinn 15 次；丢包 0；本库看到 ApplicationClosed(0x42) | 通过；16 次（8 次由 quinn 发起），quinn 16 次；丢包 0；ApplicationClosed(0x42) |
+  | 3a. 只信任另一 CA 的 quinn 客户端 → 本库服务端 | quinn：error 48 UnknownIssuer；本库服务端记录握手失败（ConnectionClosed 0x130）后继续服务 | 相同 |
+  | 3b. ALPN 为 other-alpn 的 quinn 客户端 → 本库服务端 | quinn：aborted by peer, error 120 no application protocol；本库：Transport(0x178) | 相同 |
+  | 3c. 之后正常的 quinn 客户端 → 同一本库服务端 | 通过（2 条流，4 次切换，2 次由 quinn 发起） | 相同 |
+  | 4. 只信任另一 CA 的本库客户端 → quinn 服务端 | 本库：Transport(0x130, certificate verify failed)；quinn：aborted by peer, error 48 | 相同 |
+
+  - 密钥更新的安排：服务端读完一条流后等 300 ms、强制更新、再在新阶段发回回显；客户端收到回显后等 300 ms、强制更新、再在新阶段发下一条
+    流。间隔大于 3 PTO，使上一次更新已被丢弃（否则按 RFC 9001 §6 第二次更新被视为并发而跳过，quinn 与本库都如此），且每次更新都由数据
+    携带（只强制而不发包时，双方可能在同一时刻各自翻转，分不清发起方——最初的脚本即因此在 153 上出现 "0 次由对端发起"，已改）。
+  - 153 的密钥交换组：quinn 的 ring 提供者只支持 X25519 / P-256 / P-384，本库客户端的 ClientHello 同时带 X25519MLKEM768 与 X25519，
+    协商为 X25519；quinn 客户端 → 本库服务端同为 X25519。
+
+- **测试数**：macOS 555 个（此前 491 + 64：`TlsSessionTest` 35、`RealTlsConnectionTest` 22、`RealTlsDriverTest` 6、`InteropTest` 1），
+  552 通过、3 个与 quinn 一致地跳过。153（Linux x64，Rocky 9.8）：`NETON_IO_DRIVER=epoll` 与 `iouring` 各 555 个，
+  552 通过、3 个跳过。153 在本次运行期间重启过一次（3.6 GB 内存、无交换分区，Gradle 构建与另一构建并发时失去响应）；重启后
+  `kernel.io_uring_disabled` 回到发行版默认的 2，io_uring 测试全部以 EPERM 失败，已按此前状态临时（非持久）设为 0 后重跑。此后在 153 上
+  只串行运行单个重型任务（`--max-workers=1`，`systemd-run` 与登录会话脱离）。
+- **仍未完成**：0-RTT（会话票据、早期数据密钥、是否被接受，另作后续批次单独验收）；服务端 0.5-RTT 数据（受 OpenSSL 读密钥顺序所限，
+  见上）；导出器的标签只接受 ASCII（绑定以 C 字符串传递标签；RFC 的标签均为 ASCII）；会话释放后导出器不可用（quinn 的会话随连接
+  存在）；没有系统信任库（信任锚必须显式给出，按设计）；其余目标只做了编译检查（共享源集元数据与 mingwX64、linuxArm64、iosArm64、androidNativeArm64 的编译通过），未在其上
+  运行测试；quic-interop-runner 与性能对照（§6、§10 第 9 步）未做。
