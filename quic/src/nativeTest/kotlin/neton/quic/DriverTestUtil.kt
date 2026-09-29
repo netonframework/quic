@@ -11,6 +11,10 @@ import neton.io.net.UdpSocket
 import neton.io.net.bindUdp
 import neton.io.net.runReactor
 import neton.quic.proto.ClientConfig
+import neton.quic.proto.CryptoClientConfig
+import neton.quic.proto.CryptoServerConfig
+import neton.quic.proto.TestTls
+import neton.quic.proto.TestTlsKind
 import neton.quic.proto.EndpointConfig
 import neton.quic.testkit.MockClientCrypto
 import neton.quic.testkit.MockServerCrypto
@@ -48,10 +52,14 @@ internal val V6_UNSPECIFIED: SocketAddress = SocketAddress.IPV6_UNSPECIFIED_ANY_
 /** `127.0.0.1:port`. */
 internal fun localhostV4(port: Int): SocketAddress = SocketAddress.ipv4(127, 0, 0, 1, port)
 
-/** quinn's `EndpointFactory`: endpoints suitable for connecting to themselves and each other. */
-internal class EndpointFactory {
-    val serverCrypto = MockServerCrypto()
-    val clientCrypto = MockClientCrypto()
+/**
+ * quinn's `EndpointFactory`: endpoints suitable for connecting to themselves and each other, on [tls] (the harness
+ * default: the test double unless `NETON_QUIC_TEST_TLS=real`). With real TLS the server presents the test CA's
+ * certificate for `localhost` / 127.0.0.1 / ::1 and the client trusts the CA.
+ */
+internal class EndpointFactory(tls: TestTlsKind = TestTls.kind, alpn: List<String> = emptyList()) {
+    val serverCrypto: CryptoServerConfig = if (tls == TestTlsKind.Real) TestTls.serverCrypto(alpn.map { it.encodeToByteArray() }) else MockServerCrypto(alpn = alpn.map { it.encodeToByteArray() })
+    val clientCrypto: CryptoClientConfig = if (tls == TestTlsKind.Real) TestTls.clientCrypto(alpn.map { it.encodeToByteArray() }) else MockClientCrypto(alpn = alpn.map { it.encodeToByteArray() })
     var endpointConfig: EndpointConfig = EndpointConfig.default()
 
     suspend fun endpoint(): Endpoint = endpointWithConfig(TransportConfig())
@@ -70,11 +78,11 @@ internal suspend fun endpoint(): Endpoint = EndpointFactory().endpoint()
 internal suspend fun endpointWithConfig(transportConfig: TransportConfig): Endpoint =
     EndpointFactory().endpointWithConfig(transportConfig)
 
-/** A client configuration on a fresh mock TLS client. */
-internal fun mockClientConfig(): ClientConfig = ClientConfig(MockClientCrypto())
+/** A client configuration on a fresh client of the harness's TLS layer (the test double by default). */
+internal fun mockClientConfig(): ClientConfig = ClientConfig(TestTls.defaultClientCrypto())
 
-/** A server configuration on a fresh mock TLS server. */
-internal fun mockServerConfig(): ServerConfig = ServerConfig.withCrypto(MockServerCrypto())
+/** A server configuration on a fresh server of the harness's TLS layer (the test double by default). */
+internal fun mockServerConfig(): ServerConfig = ServerConfig.withCrypto(TestTls.defaultServerCrypto())
 
 internal suspend fun bindLocalV4(): UdpSocket = bindUdp(V4_LOCALHOST)
 

@@ -25,6 +25,9 @@ internal object TestTls {
     val kind: TestTlsKind =
         if (getenv("NETON_QUIC_TEST_TLS")?.toKString().equals("real", ignoreCase = true)) TestTlsKind.Real else TestTlsKind.Mock
 
+    /** Key exchange groups of the harness's real clients (`NETON_QUIC_TEST_TLS_GROUPS`; OpenSSL's default if unset). */
+    val groups: String? = getenv("NETON_QUIC_TEST_TLS_GROUPS")?.toKString()?.ifEmpty { null }
+
     val ca: TestCa by lazy { TestCa.create() }
 
     val server: TestIdentity by lazy { ca.issue("localhost", listOf("localhost"), listOf("127.0.0.1", "::1")) }
@@ -43,7 +46,8 @@ internal object TestTls {
         trust: neton.quic.proto.Certificates = ca.trustAnchors,
         identity: TestIdentity? = null,
         cipherSuites: List<CipherSuite> = CipherSuite.entries,
-    ): TlsClientConfig = TlsClientConfig(trust, alpn, identity?.certificates, identity?.privateKey, cipherSuites)
+        groups: String? = this.groups,
+    ): TlsClientConfig = TlsClientConfig(trust, alpn, identity?.certificates, identity?.privateKey, cipherSuites, groups)
 
     /** The harness default: [kind]'s server crypto. */
     fun defaultServerCrypto(alpn: List<ByteArray> = emptyList()): CryptoServerConfig =

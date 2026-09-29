@@ -334,15 +334,26 @@ internal class TestEndpoint(var endpoint: Endpoint, var addr: SocketAddress) {
     }
 }
 
-internal fun serverConfig(crypto: MockServerCrypto = MockServerCrypto()): ServerConfig = ServerConfig.withCrypto(crypto)
+// The TLS layer of these configurations is the harness default (`TestTls.kind`: the test double unless
+// `NETON_QUIC_TEST_TLS=real`); tests that need one or the other pass their crypto configuration explicitly.
+
+internal fun serverConfig(crypto: CryptoServerConfig = TestTls.defaultServerCrypto()): ServerConfig = ServerConfig.withCrypto(crypto)
 
 internal fun serverConfigWithAlpn(vararg alpn: String): ServerConfig =
-    serverConfig(MockServerCrypto(alpn = alpn.map { it.encodeToByteArray() }))
+    serverConfig(TestTls.defaultServerCrypto(alpn.map { it.encodeToByteArray() }))
 
-internal fun clientConfig(crypto: MockClientCrypto = MockClientCrypto()): ClientConfig = ClientConfig(crypto)
+internal fun clientConfig(crypto: CryptoClientConfig = TestTls.defaultClientCrypto()): ClientConfig = ClientConfig(crypto)
 
 internal fun clientConfigWithAlpn(vararg alpn: String): ClientConfig =
-    clientConfig(MockClientCrypto(alpn = alpn.map { it.encodeToByteArray() }))
+    clientConfig(TestTls.defaultClientCrypto(alpn.map { it.encodeToByteArray() }))
+
+/** A pair on the real TLS session (whatever the harness default), with a server certificate the client trusts. */
+internal fun ConnPair.Companion.real(server: TlsServerConfig = TestTls.serverCrypto()): ConnPair =
+    ConnPair.new(EndpointConfig.default(), ServerConfig.withCrypto(server))
+
+/** A client configuration on the real TLS session, trusting the test CA. */
+internal fun realClientConfig(alpn: List<String> = emptyList()): ClientConfig =
+    ClientConfig(TestTls.clientCrypto(alpn.map { it.encodeToByteArray() }))
 
 internal fun clientConfigWithDeterministicPns(): ClientConfig =
     clientConfig().transportConfig(TransportConfig().deterministicPacketNumbers(true))
