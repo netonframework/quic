@@ -2,7 +2,7 @@ pluginManagement {
     repositories { gradlePluginPortal(); mavenCentral() }
 }
 dependencyResolutionManagement {
-    repositories { mavenLocal(); mavenCentral() }
+    repositories { mavenCentral() }
 }
 rootProject.name = "quic-build"
 include(":quic")
