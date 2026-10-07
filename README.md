@@ -33,7 +33,7 @@ What exists (SPEC §11.1–11.10):
   flights, key updates, resets and stops, closes under loss, exhausted flow-control credit, chaos soaks; two bugs found
   and fixed (both also in quinn 0.11.12); a third, found running the suite on real TLS: a server connection taken
   before the handshake completed could not open streams when the ClientHello spanned two datagrams (also in quinn
-  0.11.12, SPEC §11.11); 605 tests.
+  0.11.12, SPEC §11.11); 606 tests, run on macOS arm64 and on Linux x64 with both drivers (SPEC §11.12).
 - two-way interop with quinn 0.11 (`interop/quinn-peer`): handshake with certificate verification and ALPN,
   bidirectional stream echo, key updates initiated by each side, application close, and the rejection cases.
 

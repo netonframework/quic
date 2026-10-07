@@ -2,7 +2,7 @@
 
 > Kotlin/Native 的 QUIC（RFC 9000 / 9001 / 9002，另含 RFC 9221 数据报、DPLPMTUD、ACK Frequency 草案）协议库，建在 `com.netonstream:io` 之上。
 > 坐标 `com.netonstream:quic`，包 `neton.quic`。仓库 `quic`。
-> 状态：草案 v1（2026-09-27，按 GPT 评审修订：首版为单反应器端点并自带驱动预算、TLS 先做可行性验证、更正"无保护"实现的性质、计时先审计；待评审）。
+> 状态：v1 已实现（0-RTT 除外），实现与验收记录见 §11；首个发布版本 0.1.0（2026-10-07，依赖 io 0.2.0、openssl 4.0.2；不含 Windows 目标，见 §11.12）。
 
 ## 0. 依据与范围
 
@@ -859,3 +859,29 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
     原因）；失败只在负载极高时出现，没有发现真实 TLS 特有的问题，界限不变。
 - **仍未完成**：0-RTT（票据、早期数据、是否接受）；服务端 0.5-RTT 数据（§11.9，OpenSSL 的读密钥顺序）；以上只在 macOS 上运行（153 当时供其他
   任务使用，未在 Linux 上复验本节）。
+
+### 11.12 发布准备与 Linux 全量复验（2026-10-07 / 08，版本 0.1.0）
+- **包序号耗尽 ⚖️**（RFC 9000 §12.3）：`PacketBuilder` 在取包序号前检查数据空间的下一个序号，达到 2^62 − 2（一次可能取两个：`PacketNumberFilter`
+  会跳过一个）即 `kill(INTERNAL_ERROR "packet numbers exhausted")` 并不再发送任何包（连 CONNECTION_CLOSE 也不发）；`PacketSpace.getTxNumber`
+  保留 `nextPacketNumber < 2^62` 的不变式检查。quinn 0.11 在此断言（panic）。测试 `PacketNumberExhaustionTest`：把客户端的下一个序号设为
+  2^62 − 2（同时把已确认的最大序号设在附近，使序号可编码，如同一条真实连接走到这里时那样），再写数据：客户端连接关闭并报告
+  `ConnectionLost(Transport(INTERNAL_ERROR))`，服务端连接未关闭（没有收到任何包），只收到此前的数据。
+- **目标与依赖**：去掉 mingwX64——io（0.1.0 至 0.2.0）在 Windows 上没有 UDP，该产物无法打开端点；依赖改为 io 0.2.0、io-testkit 0.2.0（测试）、
+  openssl 4.0.2。
+- **发布配置**：版本 0.1.0；POM、签名、javadoc jar 与本地暂存仓库，与 http 相同。本地暂存产物：quic 与 quic-testkit 各 9 个目标 + 元数据，
+  共 20 个 POM、1220 个文件，全部签名；POM 依赖为 io 0.2.0、openssl 4.0.2。尚未上传 Maven Central。
+- **互通脚本能报失败**：`run-interop.sh` 每项打印 PASS / FAIL，有意外结果时以非零退出；拒绝类用例（3a、3b、4）只在以预期原因失败时才算通过
+  （日志中分别须有 `UnknownIssuer`、`no application protocol`、`certificate verify failed`），否则对端没有启动也会被当成"拒绝成功"。负对照：
+  把本库可执行文件换成 `/usr/bin/false`，8 项全部 FAIL、退出码 1。两个脚本加上可执行位。
+- **互通中本库发起的密钥更新被跳过**（测试问题，已改）：153 上本库一端只成功发起 2–5 次（应为 8 次，quinn 发起的 8 次都成功）。原因是 9 月 29 日
+  的修正（RFC 9001 §6.1：当前密钥阶段发出的包得到确认之前不得发起下一次更新；quinn 0.11 不检查）：采用对端的更新后，本库在 300 ms 的等待里
+  可能只发过 ACK（ACK 不会被确认），于是强制更新被跳过。§11.9 表中的计数是在该修正之前测得的；在 153 上用当时的二进制复测仍为 16 / 16，
+  新二进制为 10 / 13、10 / 11、12 / 12（epoll 与 io_uring 相同）。`InteropTest` 改为先发 PING、再重试强制更新直到更新发生（最多 1 s），并断言
+  本库发起的更新数等于流数（原为至少 1 次）。改后 macOS 与 153（epoll、io_uring）均为双方各 16 次（各 8 次由对端发起），quinn 记录 16 次。
+- **测试计时容差**：`LossyDriverTest.lostConnectionCloseEndsInIdleTimeout` 在 153 上测得空闲超时 2.99994 s 而失败：对端的空闲计时从它最后一次
+  收到包时开始，略早于测试开始计时的时刻，且计时器精度为毫秒。下界改为 3 s − 100 ms。复验 4 次为 3.0001–3.0020 s。
+- **计数**：606 个（605 + `PacketNumberExhaustionTest`），3 个与 quinn 一致地忽略。
+  - macOS arm64：替身 603 通过；真实 TLS（`NETON_QUIC_TEST_TLS=real`）603 通过。此前一次全量中 `LossyDriverTest.handshakeUnderRandomLoss`
+    超时失败，当时本机同时在编译 quinn（cargo），单独重跑 5 次均通过（23.8–27.1 s），无负载的全量也通过。
+  - 153（Rocky 9.8，linuxX64）：替身 + io_uring、替身 + epoll、真实 TLS + io_uring、真实 TLS + epoll 各 603 通过；quinn 互通 8 / 8。
+    串行运行（`bench-arena/quic-linux-regression.sh`），结束后无残留进程。

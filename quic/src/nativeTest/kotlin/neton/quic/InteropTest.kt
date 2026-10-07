@@ -31,6 +31,7 @@ import platform.posix.getenv
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertTrue
+import kotlin.test.fail
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -119,7 +120,7 @@ class InteropTest {
                     // The client's update came with this stream; once it is discarded (3 PTO), update ours and send
                     // the echo in the new key phase
                     kotlinx.coroutines.delay(300)
-                    conn.forceKeyUpdate()
+                    forceOurKeyUpdate(conn)
                     send.writeAll(data)
                     send.finish()
                     streams++
@@ -130,13 +131,32 @@ class InteropTest {
             val inner = conn.state.inner
             log("conn $n: closed: $reason; streams echoed $streams; key updates ${inner.keyUpdates} (${inner.peerKeyUpdates} by the peer); lost packets ${conn.stats().path.lostPackets}")
             assertTrue(streams > 0)
-            assertTrue(inner.keyUpdates - inner.peerKeyUpdates >= 1, "a key update of ours was accepted")
+            assertTrue(inner.keyUpdates - inner.peerKeyUpdates == streams.toLong(), "one key update of ours per stream")
             assertTrue(inner.peerKeyUpdates >= 1, "a key update of the peer was accepted")
         }
         assertTrue(served > 0, "no connection was served")
         endpoint.waitIdle()
         endpoint.close()
         log("server done")
+    }
+
+    /**
+     * Start a key update of ours once it is allowed. RFC 9001 §6.1, which this library enforces and quinn 0.11 does not,
+     * allows one only after a packet sent with the current keys has been acknowledged; after adopting the peer's update
+     * this side may have sent nothing but ACKs, so the update was skipped (8 updates of ours expected, 2 to 5 made on
+     * Linux). A PING gets an acknowledged packet out; retry until the update is made.
+     */
+    private suspend fun forceOurKeyUpdate(conn: Connection) {
+        val inner = conn.state.inner
+        val before = inner.keyUpdates
+        repeat(40) {
+            conn.forceKeyUpdate()
+            if (inner.keyUpdates > before) return
+            inner.ping()
+            conn.state.wake()
+            kotlinx.coroutines.delay(25)
+        }
+        fail("a key update of ours was not allowed within a second")
     }
 
     private fun client() = quicTest(120.seconds) {
@@ -162,7 +182,7 @@ class InteropTest {
             // The server's update came with the echo; once it is discarded (3 PTO), update ours and send the next
             // stream in the new key phase
             kotlinx.coroutines.delay(300)
-            conn.forceKeyUpdate()
+            forceOurKeyUpdate(conn)
         }
         val inner = conn.state.inner
         log("client echoed $streams streams, $total bytes; key updates ${inner.keyUpdates} (${inner.peerKeyUpdates} by the peer); lost packets ${conn.stats().path.lostPackets}")
@@ -171,7 +191,7 @@ class InteropTest {
         log("client closed: $reason")
         endpoint.waitIdle()
         endpoint.close()
-        assertTrue(inner.keyUpdates - inner.peerKeyUpdates >= 1, "a key update of ours was accepted")
+        assertTrue(inner.keyUpdates - inner.peerKeyUpdates == streams.toLong(), "one key update of ours per stream")
         assertTrue(inner.peerKeyUpdates >= 1, "a key update of the peer was accepted")
         assertTrue(reason is ConnectionError.LocallyClosed, "$reason")
         log("client done")

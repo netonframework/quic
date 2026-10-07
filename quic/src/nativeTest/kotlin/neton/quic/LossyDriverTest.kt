@@ -362,7 +362,9 @@ class LossyDriverTest {
         assertEquals(ConnectionError.TimedOut, server.closed()) // the peer ends by idle timeout
         val timedOut = start.elapsedNow()
         println("driver lost close: closer drained after $drained, peer timed out after $timedOut")
-        assertTrue(timedOut >= 3.seconds, "idle timeout after only $timedOut")
+        // The peer's idle timer started at its last receipt, just before `start`, and timers have millisecond
+        // granularity: 2.99994 s was seen on Linux. Well short of 3 s would mean an early close.
+        assertTrue(timedOut >= 3.seconds - 100.milliseconds, "idle timeout after only $timedOut")
         link.shutdown()
     }
 
