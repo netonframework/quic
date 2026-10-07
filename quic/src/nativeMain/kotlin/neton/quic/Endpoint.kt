@@ -202,7 +202,14 @@ class Endpoint private constructor(
         // Update connection socket references
         for (conn in connections) conn?.rebind()
         // Ensure the driver receives on the new socket
+        sizeReceiveBuffer(socket)
         startReceiving(socket)
+    }
+
+    /** Raise [socket]'s receive buffer to [DriverConfig.receiveBufferSize] if it is smaller. */
+    private fun sizeReceiveBuffer(socket: UdpSocket) {
+        val want = driverConfig.receiveBufferSize
+        if (want > 0 && socket.receiveBufferSize() < want) socket.setReceiveBufferSize(want)
     }
 
     /**
@@ -584,6 +591,7 @@ class Endpoint private constructor(
             val context = currentCoroutineContext()
             val job = Job(context[Job])
             val endpoint = Endpoint(config, serverConfig, socket, driverConfig, job, CoroutineScope(context + job))
+            endpoint.sizeReceiveBuffer(socket)
             endpoint.startReceiving(socket)
             return endpoint
         }
@@ -610,10 +618,24 @@ class DriverConfig(
     val maxDatagramsPerTurn: Int = 32 * 5,
     /** The time a receive turn may take (quinn `RECV_TIME_BOUND`), enforced by quinn's `WorkLimiter`. */
     val recvTimeBudget: Duration = 50.microseconds,
+    /**
+     * ⚖️ The least UDP receive buffer (SO_RCVBUF) the endpoint's socket gets: raised to this when smaller, never
+     * lowered; 0 leaves the socket as it is (quinn's behaviour). A burst the buffer cannot hold is lost, and every loss
+     * halves the congestion window: with Windows' 128 KiB default a loopback transfer lost about 90 of 3000 datagrams
+     * and ran at 4 MiB/s; with 1 MiB no loss on any CI platform (SPEC §11.13). quic-go raises it too. The OS may cap
+     * the value (Linux: net.core.rmem_max).
+     */
+    val receiveBufferSize: Int = DEFAULT_RECEIVE_BUFFER,
 ) {
     init {
         require(maxDatagramsPerTurn > 0) { "maxDatagramsPerTurn must be positive" }
         require(recvTimeBudget.isPositive()) { "recvTimeBudget must be positive" }
+        require(receiveBufferSize >= 0) { "receiveBufferSize must not be negative" }
+    }
+
+    companion object {
+        /** 1 MiB: the smallest size measured to remove the loss (SPEC §11.13). */
+        const val DEFAULT_RECEIVE_BUFFER = 1 shl 20
     }
 }
 

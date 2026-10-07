@@ -24,9 +24,11 @@ import kotlin.time.Duration.Companion.seconds
  *
  * What the light latency under load consists of (SPEC §11.8): the light datagrams queue behind the heavy flow's
  * in-flight data (bounded by its stream flow-control window) in the server socket's receive queue and are handled in
- * arrival order, so it is about one window's worth of processing time. The bounds are a few times the measured values
- * and well below the 1 s it takes to recover a lost Initial (initial RTT 333 ms): a starved connection, which would wait
- * for the heavy flow to end, or a handshake that needed loss recovery, fails the test.
+ * arrival order, so it is about one window's worth of processing time. The bounds stay well below the 1 s it takes to
+ * recover a lost Initial (initial RTT 333 ms) and the seconds a starved connection would wait for the heavy flow to end,
+ * so either fails the test. Since the endpoint raises its receive buffer (DriverConfig.receiveBufferSize, SPEC §11.13)
+ * the heavy flow no longer loses datagrams and fills its window, so the light requests wait about that long: request
+ * p99 up to 298 ms and max 564 ms measured on Windows CI (Linux and macOS up to 193 / 446 ms); handshakes up to 306 ms.
  */
 class FairnessTest {
 
@@ -189,8 +191,8 @@ class FairnessTest {
 
         // Bounds (SPEC §11.8 records the measured values they were chosen from)
         const val HANDSHAKE_BOUND_MS = 500L
-        const val REQUEST_P99_BOUND_MS = 250L
-        const val REQUEST_MAX_BOUND_MS = 500L
+        const val REQUEST_P99_BOUND_MS = 500L
+        const val REQUEST_MAX_BOUND_MS = 900L
 
         fun ms(nanos: Long): Long = nanos / 1_000_000
 
