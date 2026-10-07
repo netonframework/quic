@@ -91,10 +91,20 @@ class DriverBudgetTest {
         val client = clientD.await()
         val data = genData(4 * 1024 * 1024, 1)
         val reader = async { server.acceptUni().readToEnd() }
+        val started = kotlin.time.TimeSource.Monotonic.markNow()
         val send = client.openUni()
         send.writeAll(data)
         send.finish()
         assertContentEquals(data, reader.await())
+        val elapsed = started.elapsedNow()
+        // What limits the rate (a Windows run moved about 4 MiB/s, Linux about 15): loss, congestion window, RTT.
+        val cs = client.stats()
+        println(
+            "transfer: 4 MiB in $elapsed; client path: rtt ${cs.path.rtt}, min ${cs.path.minRtt}, cwnd ${cs.path.cwnd}, " +
+                "sent ${cs.path.sentPackets}, lost ${cs.path.lostPackets}, congestion events ${cs.path.congestionEvents}; " +
+                "client udp tx ${cs.udpTx.datagrams} datagrams in ${cs.udpTx.ios} sends; server udp rx ${server.stats().udpRx.datagrams}; " +
+                "socket buffers send ${endpoint.socket.sendBufferSize()} / receive ${endpoint.socket.receiveBufferSize()}",
+        )
 
         val stats = endpoint.driverStats
         println(
