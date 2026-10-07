@@ -302,13 +302,17 @@ class LossyDriverTest {
         }
         val r = server.acceptUni()
         r.readExact(ByteArray(128 * 1024))
-        var toDrop = 3 // STOP_SENDING and its first retransmissions are lost
+        // STOP_SENDING and its first retransmissions are lost. The relay counts every server datagram it forwards, also
+        // ACKs the server sent before stop() that are still queued in the relay's socket: 3 was not always enough to
+        // reach the STOP_SENDING (CI, once); 10 is, and recovery from 10 lost datagrams takes a few PTOs.
+        var toDrop = 10
         link.s2c.drop = { _, _ -> if (toDrop > 0) { toDrop--; true } else false }
         r.stop(VarInt(9))
         assertEquals(VarInt(9), writer.await())
         assertEquals(VarInt(9), s.stopped())
         s.close() // resets with the peer's code (quinn's drop)
-        assertTrue(server.stats().frameTx.stopSending >= 2, "STOP_SENDING was not retransmitted")
+        val sent = server.stats().frameTx.stopSending
+        assertTrue(sent >= 2, "STOP_SENDING was not retransmitted: sent $sent time(s), ${10 - toDrop} of 10 server datagrams dropped")
         transfer(server, client, genData(50_000, 42))
         link.shutdown()
     }
