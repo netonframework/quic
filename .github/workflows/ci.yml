@@ -1,0 +1,103 @@
+name: CI
+
+# The whole suite on every platform GitHub hosts: macOS (kqueue), Linux x64 (epoll, io_uring), Windows (IOCP, WSAPoll),
+# on the TLS test double and on real TLS (NETON_QUIC_TEST_TLS=real). Any branch, PRs, or by hand.
+#
+# com.netonstream:io comes from its repository (IO_REF) through --include-build, which replaces the Maven Central
+# dependency: UDP on Windows (io SPEC §29.7) is not in a released io yet. Once it is, drop the io checkout.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IO_REF: main
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS kqueue, os: macos-14, task: macosArm64Test, driver: "", tls: "" }
+          - { name: macOS kqueue real TLS, os: macos-14, task: macosArm64Test, driver: "", tls: real }
+          - { name: Linux epoll real TLS, os: ubuntu-latest, task: linuxX64Test, driver: epoll, tls: real }
+          - { name: Linux io_uring, os: ubuntu-latest, task: linuxX64Test, driver: iouring, tls: "" }
+          - { name: Windows IOCP, os: windows-latest, task: mingwX64Test, driver: "", tls: "" }
+          - { name: Windows IOCP real TLS, os: windows-latest, task: mingwX64Test, driver: "", tls: real }
+          - { name: Windows WSAPoll, os: windows-latest, task: mingwX64Test, driver: wsapoll, tls: "" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      NETON_IO_DRIVER: ${{ matrix.driver }}
+      NETON_QUIC_TEST_TLS: ${{ matrix.tls }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: netonframework/io
+          ref: ${{ env.IO_REF }}
+          path: io-src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
+      - name: Test
+        shell: bash
+        run: ./gradlew --include-build io-src :quic:${{ matrix.task }} --no-daemon --stacktrace --continue
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, re
+          tests = fails = 0; failed = []
+          for f in glob.glob('quic/build/test-results/**/*.xml', recursive=True):
+              s = open(f, encoding='utf-8', errors='replace').read()
+              m = re.search(r'tests="(\d+)"', s); tests += int(m.group(1)) if m else 0
+              for c in re.finditer(r'<testcase name="([^"]+)" classname="([^"]+)"[^>]*>\s*<failure message="([^"]*)"', s):
+                  fails += 1; failed.append(f"- {c.group(2)}.{c.group(1)}: {c.group(3)[:300]}")
+          print(f"### ${{ matrix.name }}: {tests} tests, {fails} failures")
+          print("\n".join(failed))
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.name }}
+          path: |
+            quic/build/test-results/**
+            quic/build/reports/tests/**
+          if-no-files-found: ignore
+
+  build-all-targets:
+    name: compile (all targets)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: netonframework/io
+          ref: ${{ env.IO_REF }}
+          path: io-src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Compile every target, link the Windows and Android test binaries
+        run: >
+          ./gradlew --include-build io-src --no-daemon --stacktrace
+          :quic:compileKotlinLinuxX64 :quic:compileKotlinLinuxArm64
+          :quic:compileKotlinMacosArm64 :quic:compileKotlinMacosX64
+          :quic:compileKotlinIosArm64 :quic:compileKotlinIosSimulatorArm64 :quic:compileKotlinIosX64
+          :quic:compileKotlinAndroidNativeArm64 :quic:compileKotlinAndroidNativeX64
+          :quic:linkDebugTestMingwX64 :quic:linkDebugTestAndroidNativeArm64
+          :quic-testkit:compileKotlinMingwX64

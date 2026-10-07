@@ -1,10 +1,10 @@
 plugins { kotlin("multiplatform"); `maven-publish` }
 
-// The targets com.netonstream:io and com.netonstream:openssl both provide (openssl has no 32-bit Android), less
-// Windows: io has no UDP there yet (io 0.2.0), so a mingwX64 artifact could not open an endpoint.
+// The targets com.netonstream:io and com.netonstream:openssl both provide (openssl has no 32-bit Android).
 kotlin {
     linuxX64(); linuxArm64()
     macosArm64(); macosX64()
+    mingwX64()
     iosArm64(); iosSimulatorArm64(); iosX64()
     androidNativeArm64(); androidNativeX64()
 

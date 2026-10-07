@@ -6,6 +6,7 @@ plugins { kotlin("multiplatform"); `maven-publish` }
 kotlin {
     linuxX64(); linuxArm64()
     macosArm64(); macosX64()
+    mingwX64()
     iosArm64(); iosSimulatorArm64(); iosX64()
     androidNativeArm64(); androidNativeX64()
 
