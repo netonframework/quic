@@ -896,3 +896,21 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
   `DriverBudgetTest.sendDrivesAreBounded`（4 MiB 传输从未用满发送预算）。各平台对照：Windows 上即使用替身，重连接也只有约 5 MiB/s（Linux / macOS
   约 23–24 MiB），发送预算的让出 0–2 次（Linux 145 次）：发送端在等计时器。原因在 io：Windows 默认 15.6 ms 的系统时钟周期使 `delay(1)` 迟到
   13–15 ms，pacing 与丢包计时器按约五分之一的速度运行；io 以每个 reactor 运行期间 `timeBeginPeriod(1)` 修正（io SPEC §29.8，修正后迟到 p50 约 1 ms）。
+- **计时修正后仍未好转**（run 37663345112）：3 个 Windows 任务失败，发送预算的让出仍为 0。`DriverBudgetTest` 加上路径统计后（run 37664936685）：Windows
+  传 4 MiB 丢 74–105 个包、14–15 次拥塞事件、拥塞窗口停在 138–192 KB、接收缓冲 128 KiB；Linux 0 丢包、窗口 4.2 MB、接收缓冲 1 MiB（GitHub
+  Ubuntu 的默认）；macOS 丢 74 个。回环上发送突发（USO 每次 10 段）超过接收缓冲即丢，每次丢包窗口减半。计时不是主因。
+- **接收缓冲实验**（测试端点）：4 MiB 时各平台 0 丢包，Windows 重连接 25–35 MiB（此前 3–5），但 `FairnessTest` 的请求 p99 在 Windows 与 macOS 上
+  为 271–344 ms，超过当时 250 ms 的界限；1 MiB 时各平台 0 丢包，只有 Windows 的两项 p99 268 / 298 ms 越界。
+- **修正 ⚖️**（所有者决定：由 quic 主动调大）：`DriverConfig.receiveBufferSize`（默认 1 MiB，即实测消除丢包的最小值；只调大不调小；0 表示不改，
+  即 quinn 的行为），端点创建与 `rebind` 时应用；操作系统可能封顶（Linux 的 `net.core.rmem_max`）。quic-go 同样主动调大接收缓冲。
+- **`FairnessTest` 的界限**：不再丢包后重连接填满其流量窗口，轻请求排在它之后，测得的正是该测试文档所述"约一个窗口的处理时间"；此前的低延迟
+  部分来自重连接因丢包跑不满窗口。按其原则（远低于丢失 Initial 的 1 s 恢复与饥饿时的数秒）重定：请求 p99 250 → 500 ms、最大 500 → 900 ms，
+  握手 500 ms 不变。修正后（run 37671374403）Windows 请求 p99 164–314 ms、最大 175–343 ms，Linux 45–78 ms，macOS 115–203 ms。
+- **`LossyDriverTest.stopSendingLostAndRetransmitted`** 在 macOS 真实 TLS 上失败一次（STOP_SENDING 只发了一次）：中继按经过的数据报计数，`stop()`
+  之前服务端已发出、仍在中继套接字里排队的 ACK 也占用"丢 3 个"的名额，3 个未必轮到 STOP_SENDING。改为丢 10 个，失败信息给出发送次数与实际
+  丢弃数。本机真实 TLS 连续 11 次通过。（原因是推断：CI 那次没有留下计数。）
+- **结果**（run 37672832185）：7 个测试任务与全目标编译全部通过。`DriverStats.blockedSends`（发送缓冲满而等待的次数）在各平台都是 0，排除了
+  "Windows 发送缓冲满、IOCP 退避轮询可写"的假设。
+- **仍未解决**：Windows 上不丢包后传 4 MiB 仍需 0.55–0.85 s（Linux 0.10–0.17 s、macOS 0.31 s），发送预算的让出 1–19 次（Linux 145 次）：发送端
+  不忙，瓶颈多半在接收侧（Windows 每次系统调用收一个数据报，Linux `recvmmsg` 一次 32 个；同一反应器上的接收轮次有 50 µs 的时间预算）。作为
+  性能项，需要在 Windows 上做剖析后再改；`DriverBudgetTest` 在 Windows IOCP 替身上只让出 1 次，处在边界上。
