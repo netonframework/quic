@@ -1,7 +1,8 @@
 # quic
 
 QUIC (RFC 9000 / 9001 / 9002) for Kotlin/Native on top of `com.netonstream:io`. The first version replicates quinn
-0.11.12 (quinn-proto). Maven coordinate `com.netonstream:quic`, package `neton.quic`.
+0.11.12 (quinn-proto). Release coordinate `com.netonstream:quic:0.1.0` (test double: `com.netonstream:quic-testkit:0.1.0`), built
+against `com.netonstream:io:0.3.0` and `com.netonstream:openssl:4.0.2`; package `neton.quic`.
 
 Specification and implementation record: [SPEC.md](SPEC.md).
 
@@ -42,8 +43,6 @@ What is missing:
   are off.
 - The server sends no 0.5-RTT data: OpenSSL yields the server's 1-RTT read secret only after the client's Finished.
 - Tests have run on macOS arm64 and Linux x64 only; the other targets are compile-checked.
-- Windows (mingwX64) needs an io release with UDP on Windows (io SPEC §29.7); until then CI builds io from its
-  repository.
 - `FairnessTest` has latency bounds that a heavily loaded host can exceed (seen at a load average above 100 on the
   development Mac); SPEC §11.11 records the measurements.
 - quic-interop-runner and the performance comparison with quinn (SPEC §6).
