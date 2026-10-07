@@ -495,6 +495,7 @@ class Endpoint private constructor(
             if (socket.trySend(tx)) return true
         }
         // The socket is full (or others are already waiting): keep a copy, since the buffer is shared
+        driverStats.blockedSends++
         val copy = buf.backingArray().copyOfRange(buf.readerIndex(), buf.readerIndex() + t.size)
         blockedSenders += 1
         try {
@@ -658,6 +659,9 @@ internal class DriverStats {
 
     /** The most segments in one transmit. */
     var maxSegmentsInTransmit = 0
+
+    /** Transmits that found the socket's send buffer full and waited for it. */
+    var blockedSends = 0L
 }
 
 /** Statistics on [Endpoint] activity (endpoint.rs:341). */

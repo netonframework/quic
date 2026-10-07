@@ -109,7 +109,7 @@ class DriverBudgetTest {
         val stats = endpoint.driverStats
         println(
             "send budget: max ${stats.maxDatagramsInDrive} datagrams per drive, max ${stats.maxSegmentsInTransmit} " +
-                "segments per transmit, ${stats.transmitYields} yields",
+                "segments per transmit, ${stats.transmitYields} yields, ${stats.blockedSends} sends blocked on a full socket",
         )
         assertTrue(stats.maxDatagramsInDrive <= 20, "a drive sent ${stats.maxDatagramsInDrive} datagrams")
         assertTrue(stats.maxSegmentsInTransmit <= 10, "a transmit had ${stats.maxSegmentsInTransmit} segments")
