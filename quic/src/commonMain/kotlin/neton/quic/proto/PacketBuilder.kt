@@ -86,6 +86,13 @@ internal class PacketBuilder {
         }
 
         val space = conn.spaces[spaceId]
+        // ⚖️ RFC 9000 §12.3: a sender whose packet numbers run out closes the connection without sending anything
+        // more, not even CONNECTION_CLOSE. Two numbers may be taken here (one skipped, see PacketNumberFilter), and
+        // 2^62 - 1 is never used. quinn 0.11 asserts instead (a panic); unreachable in practice, but not a crash.
+        if (space.nextPacketNumber >= MAX_PACKET_NUMBER - 2) {
+            conn.kill(ConnectionError.Transport(TransportError.INTERNAL_ERROR("packet numbers exhausted")))
+            return false
+        }
         val exactNumber = if (spaceId == SpaceId.Data) conn.packetNumberFilter.allocate(conn.rng, space) else space.getTxNumber()
 
         val number = PacketNumber.new(exactNumber, if (space.largestAckedPacket < 0) 0 else space.largestAckedPacket)

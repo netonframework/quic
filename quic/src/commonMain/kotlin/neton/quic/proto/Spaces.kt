@@ -135,8 +135,8 @@ internal class PacketSpace(now: Instant) {
      * In the Data space, the connection's [PacketNumberFilter] must be used rather than calling this directly.
      */
     fun getTxNumber(): Long {
-        // TODO: Handle packet number overflow gracefully
-        check(nextPacketNumber < (1L shl 62))
+        // An invariant: PacketBuilder.new closes the connection before the numbers run out (RFC 9000 §12.3).
+        check(nextPacketNumber < MAX_PACKET_NUMBER)
         val x = nextPacketNumber
         nextPacketNumber += 1
         sentWithKeys += 1
@@ -944,3 +944,6 @@ internal class PacketNumberFilter private constructor(
 
 /** Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare. */
 internal const val MAX_ACK_BLOCKS: Int = 64
+
+/** One past the largest packet number a sender may use (RFC 9000 §12.3: 2^62). */
+internal const val MAX_PACKET_NUMBER: Long = 1L shl 62
