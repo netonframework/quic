@@ -2,16 +2,10 @@ name: CI
 
 # The whole suite on every platform GitHub hosts: macOS (kqueue), Linux x64 (epoll, io_uring), Windows (IOCP, WSAPoll),
 # on the TLS test double and on real TLS (NETON_QUIC_TEST_TLS=real). Any branch, PRs, or by hand.
-#
-# com.netonstream:io comes from its repository (IO_REF) through --include-build, which replaces the Maven Central
-# dependency: UDP on Windows (io SPEC §29.7) is not in a released io yet. Once it is, drop the io checkout.
 on:
   push:
   pull_request:
   workflow_dispatch:
-
-env:
-  IO_REF: main
 
 jobs:
   test:
@@ -34,11 +28,6 @@ jobs:
       NETON_QUIC_TEST_TLS: ${{ matrix.tls }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: netonframework/io
-          ref: ${{ env.IO_REF }}
-          path: io-src
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -51,7 +40,7 @@ jobs:
           key: konan-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
       - name: Test
         shell: bash
-        run: ./gradlew --include-build io-src :quic:${{ matrix.task }} --no-daemon --stacktrace --continue
+        run: ./gradlew :quic:${{ matrix.task }} --no-daemon --stacktrace --continue
       - name: Summary
         if: always()
         shell: bash
@@ -82,11 +71,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: netonframework/io
-          ref: ${{ env.IO_REF }}
-          path: io-src
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -94,7 +78,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Compile every target, link the Windows and Android test binaries
         run: >
-          ./gradlew --include-build io-src --no-daemon --stacktrace
+          ./gradlew --no-daemon --stacktrace
           :quic:compileKotlinLinuxX64 :quic:compileKotlinLinuxArm64
           :quic:compileKotlinMacosArm64 :quic:compileKotlinMacosX64
           :quic:compileKotlinIosArm64 :quic:compileKotlinIosSimulatorArm64 :quic:compileKotlinIosX64
