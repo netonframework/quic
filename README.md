@@ -42,8 +42,8 @@ What is missing:
   are off.
 - The server sends no 0.5-RTT data: OpenSSL yields the server's 1-RTT read secret only after the client's Finished.
 - Tests have run on macOS arm64 and Linux x64 only; the other targets are compile-checked.
-- No Windows target: neton-io has no UDP on Windows yet (io 0.2.0), so a mingwX64 artifact could not open an
-  endpoint.
+- Windows (mingwX64) needs an io release with UDP on Windows (io SPEC §29.7); until then CI builds io from its
+  repository.
 - `FairnessTest` has latency bounds that a heavily loaded host can exceed (seen at a load average above 100 on the
   development Mac); SPEC §11.11 records the measurements.
 - quic-interop-runner and the performance comparison with quinn (SPEC §6).

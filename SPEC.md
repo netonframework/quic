@@ -885,3 +885,14 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
     超时失败，当时本机同时在编译 quinn（cargo），单独重跑 5 次均通过（23.8–27.1 s），无负载的全量也通过。
   - 153（Rocky 9.8，linuxX64）：替身 + io_uring、替身 + epoll、真实 TLS + io_uring、真实 TLS + epoll 各 603 通过；quinn 互通 8 / 8。
     串行运行（`bench-arena/quic-linux-regression.sh`），结束后无残留进程。
+
+### 11.13 Windows 与 CI（2026-10-08）
+- **恢复 mingwX64**：io 补上 Windows 的 UDP（io SPEC §29.7：`WSARecvMsg` / `WSASendMsg`、ECN、PKTINFO、USO；IOCP 以 0 字节 `MSG_PEEK` 接收等待可读）
+  后，quic 与 quic-testkit 重新提供 mingwX64（§11.12 曾因 io 没有 UDP 而去掉）。
+- **CI**（`.github/workflows/ci.yml`，此前本仓库没有 CI）：全量测试在 macOS（kqueue）、Linux（epoll、io_uring）、Windows（IOCP、WSAPoll）上运行，替身与
+  真实 TLS（`NETON_QUIC_TEST_TLS=real`）各有覆盖，共 7 项，另编译全部目标、链接 Windows 与 Android 测试程序。io 在含 Windows UDP 的版本发布之前以
+  `--include-build` 取其仓库的 main。
+- **第一轮**（run 37658939882）：6 项通过，Windows IOCP + 真实 TLS 失败 2 个——`FairnessTest`（重连接在轻负载阶段只传了 3.7 MB，下限 4 MiB）与
+  `DriverBudgetTest.sendDrivesAreBounded`（4 MiB 传输从未用满发送预算）。各平台对照：Windows 上即使用替身，重连接也只有约 5 MiB/s（Linux / macOS
+  约 23–24 MiB），发送预算的让出 0–2 次（Linux 145 次）：发送端在等计时器。原因在 io：Windows 默认 15.6 ms 的系统时钟周期使 `delay(1)` 迟到
+  13–15 ms，pacing 与丢包计时器按约五分之一的速度运行；io 以每个 reactor 运行期间 `timeBeginPeriod(1)` 修正（io SPEC §29.8，修正后迟到 p50 约 1 ms）。
