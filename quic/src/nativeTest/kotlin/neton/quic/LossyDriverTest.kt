@@ -201,8 +201,13 @@ class LossyDriverTest {
 
     @Test
     fun handshakeUnderRandomLoss() = lossyTest(300.seconds) {
+        // At 30% loss each way a handshake flight of several datagrams is often lost again and again, and the probe
+        // timeout doubles each time: six or seven losses in a row pass the default 30 s idle timeout (seen once in CI
+        // and once on a loaded host; locally a seed takes 2 to 3 s). The test is about finishing the handshake under
+        // loss, not about the idle timeout, so it allows 120 s.
+        val handshakeTransport = TransportConfig().maxIdleTimeout(IdleTimeout.of(120.seconds))
         for (seed in 0L until 10L) {
-            val link = link(seed, loss = 0.3)
+            val link = link(seed, loss = 0.3, transport = handshakeTransport)
             val (client, server) = link.connect()
             link.c2s.loss = 0.05
             link.s2c.loss = 0.05
