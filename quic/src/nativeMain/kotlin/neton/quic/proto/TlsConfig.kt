@@ -71,8 +71,8 @@ import kotlin.native.ref.createCleaner
 // throws [IllegalStateException].
 //
 // No insecure defaults: TLS 1.3 only; the three QUIC cipher suites only (RFC 9001 §5.3; CCM is left out as in
-// rustls); a client verifies the server's certificate chain against trust anchors it is given explicitly (there is no
-// implicit system trust store) and the server name (DNS SAN, or IP SAN for an IP address); a client without trust
+// rustls); a client verifies the server's certificate chain against trust anchors it is given explicitly (the
+// system's roots only through Certificates.system(), never implicitly) and the server name (DNS SAN, or IP SAN for an IP address); a client without trust
 // anchors can only be made with [TlsClientConfig.dangerousNoServerVerificationForTestsOnly]. Session tickets, resumption
 // and 0-RTT are off (0-RTT is a later, separate batch, SPEC §11.9).
 
@@ -108,6 +108,22 @@ class Certificates private constructor(internal val der: List<ByteArray>) {
         }
 
         fun pem(pem: String): Certificates = pem(pem.encodeToByteArray())
+
+        /**
+         * The operating system's trusted root certificates (rustls-native-certs `load_native_certs`), for a client that
+         * verifies servers on the public Internet: `TlsClientConfig(Certificates.system(), ...)`. `SSL_CERT_FILE` (a PEM
+         * bundle) and `SSL_CERT_DIR` (PEM directories, ':'-separated) replace the platform's store when set. Otherwise:
+         * Linux, the distribution's CA bundle (or `/etc/ssl/certs`); Android, the system CA directory; macOS, the
+         * Security framework's anchor certificates; Windows, the system ROOT store. Read on every call; keep the result.
+         *
+         * @throws UnsupportedOperationException on iOS, which has no API to list them.
+         * @throws IllegalStateException when no certificate is found.
+         */
+        fun system(): Certificates {
+            val der = systemRootsDer()
+            check(der.isNotEmpty()) { "no system root certificates found (set SSL_CERT_FILE or pass trust anchors)" }
+            return Certificates(der)
+        }
     }
 }
 
@@ -518,7 +534,7 @@ internal fun toDer(x: CPointer<X509>): ByteArray {
     return out
 }
 
-private inline fun <T> withMemBio(bytes: ByteArray, block: (CPointer<BIO>) -> T): T {
+internal inline fun <T> withMemBio(bytes: ByteArray, block: (CPointer<BIO>) -> T): T {
     require(bytes.isNotEmpty()) { "empty input" }
     return bytes.usePinned { pinned ->
         val bio = BIO_new_mem_buf(pinned.addressOf(0), bytes.size) ?: throw IllegalStateException("BIO_new_mem_buf failed")

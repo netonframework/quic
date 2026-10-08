@@ -1033,3 +1033,19 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
   `RealTlsDriverTest.earlyDataIsVisibleToAServerThatAwaitsTheHandshake`：等握手完成再接受流，0-RTT 的流 `is0rtt` 为假、`isEarlyData` 为真，
   握手后打开的流两者皆假。macOS 全量两种 TLS 模式各 619 个通过。
 
+### 11.19 系统信任库（2026-10-08）
+- `Certificates.system()`（rustls-native-certs `load_native_certs`）：操作系统信任的根证书，用于验证公网上的服务端，例如
+  `TlsClientConfig(Certificates.system(), alpn)`。仍不隐式使用：信任锚总是由调用方给出（§4 "无不安全默认"不变）。
+- 来源：`SSL_CERT_FILE`（PEM 证书包）与 `SSL_CERT_DIR`（PEM 目录，以 ':' 分隔）设置时取代平台存储（同 rustls-native-certs）；否则——
+  Linux 按 openssl-probe 的清单取第一个存在的发行版证书包（`/etc/ssl/certs/ca-certificates.crt`、`/etc/pki/tls/certs/ca-bundle.crt`、
+  `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` 等），都没有时读 `/etc/ssl/certs`；Android 读 Conscrypt APEX 的
+  `/apex/com.android.conscrypt/cacerts`（Android 14 起），否则 `/system/etc/security/cacerts`（不信任用户添加的 CA，与面向 API 24+ 的应用相同）；
+  macOS 取 Security 框架的锚证书（`SecTrustCopyAnchorCertificates`；管理员 / 用户在钥匙串中改过的信任设置未应用，rustls-native-certs 会读，
+  需要时再补）；Windows 读系统 "ROOT" 存储（自动根更新尚未取回的根不在其中）；iOS 没有列出系统根的 API，抛 `UnsupportedOperationException`
+  （rustls-native-certs 同样不支持 iOS）。
+- 每张证书都解析校验，无法解析的跳过；重复的（证书目录中的哈希链接）只保留一份；一张都没有时抛 `IllegalStateException`。
+- 发布用的元数据编译不接受 nativeMain 中的 `opendir`（各平台签名不同，未被共同化），目录列举改为各平台的 actual（与 SPEC 记下的
+  `mode_t` 等宽度陷阱同类）。
+- 测试 `SystemRootsTest`：本机 macOS 157 个根；每张唯一、可构成客户端配置；PEM 读取跳过文本与其他块（Android 的文件格式）、不存在的文件 /
+  目录得到空。Linux、Windows 的实际数目由 CI 打印。
+

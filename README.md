@@ -20,9 +20,11 @@ What exists (SPEC §11.1–11.10):
   negotiation, stateless reset);
 - **real TLS 1.3** (SPEC §4, §11.9): `TlsSession`, `TlsClientConfig` and `TlsServerConfig`, implemented in this
   library on OpenSSL 4.0.2's third-party QUIC TLS interface through openssl-kotlin's raw bindings — certificate
-  chain and host name / IP verification against explicitly given trust anchors (no insecure default), optional client
-  authentication, ALPN, the QUIC transport parameters extension, TLS alerts as CRYPTO_ERROR, 1-RTT key updates, the
-  exporter, with explicit exactly-once release of every native object and a GC cleaner only as a backstop;
+  chain and host name / IP verification against explicitly given trust anchors (no insecure default; the operating
+  system's roots through `Certificates.system()`, SPEC §11.19), optional client authentication, ALPN, the QUIC transport
+  parameters extension, TLS alerts as CRYPTO_ERROR, 1-RTT key updates, the exporter, session resumption and 0-RTT, a key
+  log (`KeyLogFile`, `SSLKEYLOGFILE`), with explicit exactly-once release of every native object and a GC cleaner only as
+  a backstop;
 - deterministic release of native key contexts and TLS sessions: explicit ownership and release points;
 - the driver layer (SPEC §3, §11.8): the endpoint, connection and stream API on neton-io UDP sockets on one reactor,
   with receive and send budgets, the lifecycle rules as explicit `close()`, streams as neton-io `IoStream`;
