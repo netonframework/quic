@@ -1,0 +1,98 @@
+name: Interop Runner
+
+# The QUIC Interop Runner (https://github.com/quic-interop/quic-interop-runner) between the neton endpoint
+# (interop/runner) and itself, quinn, quic-go and ngtcp2, in both directions. Fails only when a supported test case
+# fails between neton and neton; the other pairs are reported in the job summary.
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  # The runner revision these results are for (2026-09-17).
+  RUNNER_REF: 740c05a10b61d65e8abd3ad38d60898004d335d9
+
+jobs:
+  image:
+    name: build the endpoint image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
+      - name: Link the endpoint
+        run: ./gradlew -p interop/runner linkReleaseExecutableLinuxX64 --no-daemon --stacktrace
+      - name: Build and save the image
+        run: |
+          docker build -t neton-quic-interop:ci interop/runner
+          docker save neton-quic-interop:ci | zstd -q -o neton-quic-interop.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neton-quic-interop-image
+          path: neton-quic-interop.tar.zst
+          retention-days: 3
+
+  run:
+    name: interop runner (neton and ${{ matrix.peer }})
+    needs: image
+    strategy:
+      fail-fast: false
+      matrix:
+        peer: [neton, quinn, quic-go, ngtcp2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      # The runner needs docker engine >= 28.1.
+      - uses: docker/setup-docker-action@v4
+        with:
+          version: version=v28.3.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Enable IPv6 in the simulator
+        run: sudo modprobe ip6table_filter
+      - name: Install Wireshark (the runner needs 4.5 or newer)
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/nightly
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tshark
+          tshark --version | head -1
+      - name: Check out the runner
+        run: |
+          git clone -q https://github.com/quic-interop/quic-interop-runner.git runner
+          git -C runner checkout -q "$RUNNER_REF"
+          pip install -q -U pip
+          pip install -q -r runner/requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: neton-quic-interop-image
+      - name: Load the image
+        run: zstd -dc neton-quic-interop.tar.zst | docker load
+      - name: Run
+        env:
+          CRON: "true"
+        run: |
+          mkdir out && cd out
+          bash ../interop/runner/run.sh "$GITHUB_WORKSPACE/runner" neton-quic-interop:ci ${{ matrix.peer }}
+      - name: Summary
+        if: always()
+        run: |
+          cd out
+          python3 ../interop/runner/summary.py results-*.json | tee -a "$GITHUB_STEP_SUMMARY"
+          exit ${PIPESTATUS[0]}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-runner-${{ matrix.peer }}
+          path: out/**
+          retention-days: 7
+          if-no-files-found: ignore

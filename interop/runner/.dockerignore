@@ -1,0 +1,3 @@
+*
+!build/bin/linuxX64/releaseExecutable/endpoint.kexe
+!run_endpoint.sh
