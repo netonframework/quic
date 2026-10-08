@@ -7,6 +7,11 @@ on:
   push:
   workflow_dispatch:
 
+# A newer push supersedes a run still going (a full run takes about an hour).
+concurrency:
+  group: interop-runner-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # The runner revision these results are for (2026-09-17).
   RUNNER_REF: 740c05a10b61d65e8abd3ad38d60898004d335d9
