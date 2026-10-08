@@ -152,8 +152,9 @@ class TlsSessionTest {
         // client: ClientHello at Initial; Handshake keys after the ServerHello; its Finished at Handshake; then 1-RTT
         assertEquals(listOf("send@0", "keys@1", "send@1", "keys@2"), c.events)
         // server: ServerHello at Initial, Handshake keys, its flight at Handshake; 1-RTT keys after the client's
-        // Finished (OpenSSL yields the server's 1-RTT read secret then)
-        assertEquals(listOf("send@0", "keys@1", "send@1", "keys@2"), s.events)
+        // Finished (OpenSSL yields the server's 1-RTT read secret then); then its session tickets at 1-RTT (rustls
+        // sends NewSessionTicket at 1-RTT too)
+        assertEquals(listOf("send@0", "keys@1", "send@1", "keys@2", "send@2"), s.events)
         assertEquals(1, c.handshakeDataReady)
         assertEquals(1, s.handshakeDataReady)
         // Handshake and 1-RTT keys agree in both directions, packet and header protection
@@ -483,6 +484,14 @@ class TlsSessionTest {
             val cEnd = End(c, "client")
             val sEnd = End(s, "server")
             // The alert callback only runs on a failure: make the server fail with an ALPN mismatch for it
+            // A ticket the client cannot keep is dropped; the connection goes on
+            if (cb == TlsCallback.NEW_SESSION) {
+                c.injectCallbackFailure(cb)
+                exchange(cEnd, sEnd)
+                assertFalse(c.isHandshaking)
+                assertEquals(1, c.core.droppedTickets, "the ticket whose callback failed was dropped")
+                continue
+            }
             if (cb == TlsCallback.ALERT) {
                 s.injectCallbackFailure(cb)
                 val bad = own(own(TestTls.clientCrypto(alpn = listOf("zz".encodeToByteArray()))).startSession(1, "localhost", params(Side.Client)) as TlsSession)

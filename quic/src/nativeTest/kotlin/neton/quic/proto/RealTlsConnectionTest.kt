@@ -9,6 +9,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
@@ -446,44 +447,121 @@ class RealTlsConnectionTest {
         assertEquals(keys, NativeKeys.live, "native key contexts left after refused / retried attempts")
     }
 
-    // ---- 0-RTT is declined cleanly (not in this batch, SPEC §11.9 / §11.11) ----
+    // ---- 0-RTT on the real TLS session (SPEC §11.14) ----
 
-    /**
-     * A client that connected before connects again with the same configuration: there is no ticket, so no 0-RTT
-     * keys, no early streams, and the second connection is an ordinary full handshake (quinn's `zero_rtt_happypath`
-     * up to the point where it needs a ticket).
-     */
-    @Test
-    fun zeroRttIsDeclinedOnReconnect() {
-        val pair = ConnPair.real()
-        val config = realClient()
-        run {
-            val (clientCh, _) = pair.connectWith(config.copy())
-            pair.clientConn(clientCh).close(pair.time, VarInt(0), Bytes.EMPTY)
-            pair.drive()
-        }
-        pair.client.addr = localhostV6(nextClientPort())
-        val clientCh = pair.beginConnect(config)
-        assertFalse(pair.clientConn(clientCh).has0rtt())
-        assertNull(pair.clientConn(clientCh).cryptoSession().earlyCrypto())
-        // Without 0-RTT the server's stream limits are unknown until the handshake: no early stream.
-        assertNull(pair.clientStreams(clientCh).open(Dir.Uni))
-        pair.drive()
-        val serverCh = pair.server.assertAccept()
-        pair.assertClientConnectedAfterDrive(clientCh)
-        assertFalse(pair.clientConn(clientCh).accepted0rtt())
-        assertEquals(false, pair.clientConn(clientCh).cryptoSession().earlyDataAccepted())
-        assertNull(pair.serverConn(serverCh).cryptoSession().earlyDataAccepted())
+    /** Connect once, close, and return the client's ticket count. */
+    private fun ConnPair.connectOnce(config: ClientConfig): Int {
+        val (clientCh, _) = connectWith(config.copy())
+        clientConn(clientCh).close(time, VarInt(0), Bytes.EMPTY)
+        drive()
+        client.addr = localhostV6(nextClientPort())
+        return (config.crypto as TlsClientConfig).tickets.size
+    }
 
-        val s = pair.clientStreams(clientCh).open(Dir.Uni)!!
-        val msg = "Hello, 1-RTT!".encodeToByteArray()
-        pair.clientSend(clientCh, s).writeOk(msg)
-        pair.clientSend(clientCh, s).finish()
-        pair.drive()
-        val chunks = pair.serverRecv(serverCh, s).read(false)
+    /** Send [msg] on a new uni stream before the handshake and check the server got it; returns the server handle. */
+    private fun ConnPair.sendEarly(clientCh: ConnectionHandle, msg: ByteArray): ConnectionHandle {
+        val s = clientStreams(clientCh).open(Dir.Uni)!!
+        clientSend(clientCh, s).writeOk(msg)
+        clientSend(clientCh, s).finish()
+        drive()
+        val serverCh = server.assertAccept()
+        assertClientConnectedAfterDrive(clientCh)
+        val chunks = serverRecv(serverCh, s).read(false)
         assertContentEquals(msg, chunks.nextChunk().bytes.toByteArray())
         chunks.finalize()
+        return serverCh
+    }
+
+    /**
+     * quinn's `zero_rtt_happypath` on real TLS: the server issues tickets, the client resumes with one and sends a
+     * stream in 0-RTT before the handshake; the server accepts it (OpenSSL's early data status ACCEPTED on both sides).
+     */
+    @Test
+    fun zeroRttIsAcceptedOnReconnect() {
+        val pair = ConnPair.real()
+        val config = realClient()
+        assertTrue(pair.connectOnce(config) > 0, "the server issued tickets")
+        val clientCh = pair.beginConnect(config)
+        assertTrue(pair.clientConn(clientCh).has0rtt())
+        assertNotNull(pair.clientConn(clientCh).cryptoSession().earlyCrypto())
+        val serverCh = pair.sendEarly(clientCh, "Hello, 0-RTT!".encodeToByteArray())
+        assertTrue(pair.clientConn(clientCh).accepted0rtt())
+        assertEquals(true, pair.clientConn(clientCh).cryptoSession().earlyDataAccepted())
+        assertNull(pair.serverConn(serverCh).cryptoSession().earlyDataAccepted())
         assertEquals(0L, pair.clientConn(clientCh).stats().path.lostPackets)
+    }
+
+    /**
+     * OpenSSL's replay protection (on whenever the server accepts early data): each ticket works once. The same ticket
+     * offered again resumes nothing; the client's 0-RTT is rejected and its data goes again at 1-RTT.
+     */
+    @Test
+    fun aReplayedTicketGetsItsZeroRttRejected() {
+        val pair = ConnPair.real()
+        val config = realClient()
+        pair.connectOnce(config)
+        val tickets = (config.crypto as TlsClientConfig).tickets
+        val ticket = assertNotNull(tickets.take("localhost"))
+        tickets.add("localhost", ticket)
+
+        val firstCh = pair.beginConnect(config.copy())
+        pair.sendEarly(firstCh, "first".encodeToByteArray())
+        assertTrue(pair.clientConn(firstCh).accepted0rtt())
+        pair.clientConn(firstCh).close(pair.time, VarInt(0), Bytes.EMPTY)
+        pair.drive()
+
+        // The newest tickets are the ones the second connection just received; put the used one back on top.
+        pair.client.addr = localhostV6(nextClientPort())
+        tickets.add("localhost", ticket)
+        val replayCh = pair.beginConnect(config)
+        assertTrue(pair.clientConn(replayCh).has0rtt(), "the client offers 0-RTT with the replayed ticket")
+        val s = pair.clientStreams(replayCh).open(Dir.Uni)!!
+        val msg = "replayed".encodeToByteArray()
+        pair.clientSend(replayCh, s).writeOk(msg)
+        pair.drive()
+        pair.assertClientConnectedAfterDrive(replayCh)
+        assertFalse(pair.clientConn(replayCh).accepted0rtt(), "the server rejects the replayed ticket")
+        val serverCh = pair.server.assertAccept()
+        // As quinn's zero_rtt_rejection: the 0-RTT streams are gone, the same stream ID opens again, and nothing of the
+        // 0-RTT data arrived; the application sends it again at 1-RTT
+        val s2 = pair.clientStreams(replayCh).open(Dir.Uni)!!
+        assertEquals(s, s2)
+        var chunks = pair.serverRecv(serverCh, s2).read(false)
+        assertEquals(ReadError.Blocked, chunks.next(Int.MAX_VALUE))
+        chunks.finalize()
+        assertEquals(msg.size, pair.clientSend(replayCh, s2).writeOk(msg))
+        pair.clientSend(replayCh, s2).finish()
+        pair.drive()
+        chunks = pair.serverRecv(serverCh, s2).read(false)
+        assertContentEquals(msg, chunks.nextChunk().bytes.toByteArray())
+        chunks.finalize()
+    }
+
+    /** Early data off on either side: the session is resumed (or not) without 0-RTT; data goes at 1-RTT. */
+    @Test
+    fun zeroRttCanBeTurnedOffOnEitherSide() {
+        // Client: tickets allow 0-RTT, but the client does not send it.
+        run {
+            val pair = ConnPair.real()
+            val config = ClientConfig(TlsClientConfig(TestTls.ca.trustAnchors, enableEarlyData = false))
+            pair.connectOnce(config)
+            val clientCh = pair.beginConnect(config)
+            assertFalse(pair.clientConn(clientCh).has0rtt())
+            pair.drive()
+            pair.assertClientConnectedAfterDrive(clientCh)
+            assertFalse(pair.clientConn(clientCh).accepted0rtt())
+        }
+        // Server: its tickets do not allow 0-RTT.
+        run {
+            val server = TlsServerConfig(TestTls.server.certificates, TestTls.server.privateKey, earlyData = false)
+            val pair = ConnPair.real(server)
+            val config = realClient()
+            assertTrue(pair.connectOnce(config) > 0)
+            val clientCh = pair.beginConnect(config)
+            assertFalse(pair.clientConn(clientCh).has0rtt())
+            pair.drive()
+            pair.assertClientConnectedAfterDrive(clientCh)
+        }
     }
 
     /**

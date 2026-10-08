@@ -85,22 +85,6 @@ internal object TestTls {
         else -> throw AssertionError("no handshake data of a known TLS layer: $handshakeData")
     }
 
-    /**
-     * Skip the calling test when the harness runs on real TLS, printing why (kotlin.test has no runtime skip; the
-     * line appears in the test's output and the XML report's system-out). Returns `true` if the test must return.
-     * Only for behaviour the real session does not provide in this batch (SPEC §11.9 / §11.11), never to hide a
-     * difference that is not understood.
-     */
-    fun skipOnReal(test: String, reason: String): Boolean {
-        if (kind != TestTlsKind.Real) return false
-        println("SKIPPED on real TLS: $test: $reason")
-        return true
-    }
-
-    /** Why the 0-RTT tests do not run on real TLS. */
-    const val NO_ZERO_RTT = "0-RTT (session tickets, early data) is not in this batch of the real TLS session (SPEC §11.9); " +
-        "it declines 0-RTT, which RealTlsConnectionTest / RealTlsDriverTest verify"
-
     /** A self-signed certificate with many names, too big for the first flight's amplification limit (quinn `big_cert_and_key`). */
     val bigSelfSigned: TestIdentity by lazy { TestPki.selfSigned(listOf("localhost") + (0 until 1000).map { "foo_$it" }) }
 }

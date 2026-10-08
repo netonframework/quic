@@ -156,11 +156,10 @@ class DriverTest {
 
     @Test
     fun zeroRtt() {
-        if (TestTls.skipOnReal("DriverTest.zeroRtt", TestTls.NO_ZERO_RTT)) return
-        zeroRttOnTheTestDouble()
+        zeroRttRoundTrips()
     }
 
-    private fun zeroRttOnTheTestDouble() = quicTest {
+    private fun zeroRttRoundTrips() = quicTest {
         val endpoint = endpoint()
         val msg0 = "zero".encodeToByteArray()
         val msg1 = "one".encodeToByteArray()

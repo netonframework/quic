@@ -252,7 +252,6 @@ class ConnectionTest {
     // mod.rs:605
     @Test
     fun zeroRttHappypath() {
-        if (TestTls.skipOnReal("ConnectionTest.zeroRttHappypath", TestTls.NO_ZERO_RTT)) return
         val pair = ConnPair.default()
         pair.server.handleIncoming = ::validateIncoming
         val config = clientConfig()
@@ -292,7 +291,7 @@ class ConnectionTest {
     // mod.rs:671
     @Test
     fun zeroRttRejection() {
-        if (TestTls.skipOnReal("ConnectionTest.zeroRttRejection", TestTls.NO_ZERO_RTT)) return
+        if (TestTls.kind == TestTlsKind.Real) return zeroRttWithChangedProtocolsOnRealTls()
         val pair = ConnPair.new(EndpointConfig.default(), serverConfigWithAlpn("foo", "bar"))
         val clientCrypto = MockClientCrypto(alpn = listOf("foo".encodeToByteArray()))
 
@@ -346,6 +345,39 @@ class ConnectionTest {
         chunks.finalize()
     }
 
+    /**
+     * [zeroRttRejection] on the real TLS session: ⚖️ a ticket whose protocol the client no longer offers resumes the
+     * session without 0-RTT (OpenSSL would fail the handshake; rustls sends 0-RTT that the server rejects, SPEC §11.14),
+     * and the data goes out at 1-RTT. The server's rejection path is [RealTlsConnectionTest]'s replayed ticket.
+     */
+    private fun zeroRttWithChangedProtocolsOnRealTls() {
+        val pair = ConnPair.new(EndpointConfig.default(), serverConfigWithAlpn("foo", "bar"))
+        val first = TestTls.clientCrypto(listOf("foo".encodeToByteArray()))
+        val firstCh = pair.beginConnect(clientConfig(first))
+        pair.drive()
+        pair.server.assertAccept()
+        pair.clientConn(firstCh).close(pair.time, VarInt(0), Bytes.EMPTY)
+        pair.drive()
+        assertTrue(first.tickets.size > 0, "the server issued tickets")
+
+        // Same session cache, different protocols
+        val second = TestTls.clientCrypto(listOf("bar".encodeToByteArray())).also { it.tickets = first.tickets }
+        val clientCh = pair.beginConnect(clientConfig(second))
+        assertFalse(pair.clientConn(clientCh).has0rtt())
+        pair.drive()
+        pair.assertClientConnectedAfterDrive(clientCh)
+        assertFalse(pair.clientConn(clientCh).accepted0rtt())
+        val serverCh = pair.server.assertAccept()
+        val s = pair.clientStreams(clientCh).open(Dir.Uni)!!
+        val msg = "Hello, 1-RTT!".encodeToByteArray()
+        pair.clientSend(clientCh, s).writeOk(msg)
+        pair.clientSend(clientCh, s).finish()
+        pair.drive()
+        val chunks = pair.serverRecv(serverCh, s).read(false)
+        assertContentEquals(msg, chunks.nextChunk().bytes.toByteArray())
+        chunks.finalize()
+    }
+
     private fun testZeroRttIncomingLimit(configureServer: (ServerConfig) -> Unit) {
         // caller sets the server limit to 4000 bytes; the client writes 8000 bytes, split across 8 packets: the first
         // packet is stored in the Incoming, the next three are incoming-buffered, bringing the incoming buffer size to
@@ -356,7 +388,8 @@ class ConnectionTest {
         val config = serverConfig()
         configureServer(config)
         val pair = ConnPair.new(EndpointConfig.default(), config)
-        val clientConfig = clientConfig()
+        // The counts assume a ClientHello in one datagram (real TLS's default ClientHello takes two)
+        val clientConfig = oneDatagramHelloClientConfig()
 
         // Establish normal connection
         val firstCh = pair.beginConnect(clientConfig.copy())
@@ -409,14 +442,12 @@ class ConnectionTest {
     // mod.rs:854
     @Test
     fun zeroRttIncomingBufferSize() {
-        if (TestTls.skipOnReal("ConnectionTest.zeroRttIncomingBufferSize", TestTls.NO_ZERO_RTT)) return
         testZeroRttIncomingLimit { it.incomingBufferSize(4000) }
     }
 
     // mod.rs:861
     @Test
     fun zeroRttIncomingBufferSizeTotal() {
-        if (TestTls.skipOnReal("ConnectionTest.zeroRttIncomingBufferSizeTotal", TestTls.NO_ZERO_RTT)) return
         testZeroRttIncomingLimit { it.incomingBufferSizeTotal(4000) }
     }
 

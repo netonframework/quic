@@ -1,7 +1,19 @@
 package neton.quic
 
+import kotlin.native.runtime.GC
+import kotlin.native.runtime.NativeRuntimeApi
+import kotlin.test.Test
+import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import neton.io.bytes.Bytes
 import neton.io.net.bindUdp
@@ -20,17 +32,6 @@ import neton.quic.proto.VarInt
 import neton.quic.proto.default
 import neton.quic.proto.withCrypto
 import neton.quic.testkit.TestCa
-import kotlin.native.runtime.GC
-import kotlin.native.runtime.NativeRuntimeApi
-import kotlin.test.Test
-import kotlin.test.assertContentEquals
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertIs
-import kotlin.test.assertNotNull
-import kotlin.test.assertNull
-import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.seconds
 
 /**
  * End to end over the `neton.quic` driver on loopback UDP with the real TLS session: echo on many streams with key
@@ -124,17 +125,19 @@ class RealTlsDriverTest {
     }
 
     /**
-     * 0-RTT is not in this batch (SPEC §11.9): a client connecting again after a completed connection has no ticket,
-     * so `into0Rtt` declines and hands the `Connecting` back unchanged, and the full handshake carries the data
-     * (quinn's `zero_rtt` up to the point where it needs a ticket; that test skips on real TLS).
+     * 0-RTT through the driver on real TLS (SPEC §11.14; quinn's `zero_rtt`): the first connection leaves the client
+     * with tickets; the second sends its request in 0-RTT (`into0Rtt`), the server accepts it, and the echo comes back.
+     * The first connection waits for its tickets before it closes: they arrive after the handshake, and a client that
+     * closes at once may close before they come (quinn and rustls alike).
      */
     @Test
-    fun zeroRttIsDeclinedOnReconnect() = quicTest {
+    fun zeroRttThroughTheDriver() = quicTest {
         val server = server()
-        val client = client()
+        val crypto = TestTls.clientCrypto(h3)
+        val client = client(ClientConfig(crypto))
         val serverTask = launch {
             repeat(2) {
-                val conn = assertNotNull(server.accept()).await()
+                val (conn, _) = assertNotNull(assertNotNull(server.accept()).accept().into0Rtt())
                 launch {
                     val (send, recv) = conn.acceptBi()
                     send.writeAll(recv.readToEnd())
@@ -145,13 +148,16 @@ class RealTlsDriverTest {
         }
         repeat(2) { round ->
             val connecting = client.connect(server.localAddr(), "localhost")
-            assertNull(connecting.into0Rtt(), "round $round: 0-RTT without a ticket")
-            val conn = connecting.await()
+            val early = connecting.into0Rtt()
+            if (round == 0) assertNull(early, "no ticket yet") else assertNotNull(early, "round 1 resumes with 0-RTT")
+            val conn = early?.first ?: connecting.await()
             val (send, recv) = conn.openBi()
             val msg = "round $round".encodeToByteArray()
             send.writeAll(msg)
             send.finish()
             assertContentEquals(msg, recv.readToEnd())
+            if (early != null) assertTrue(early.second.await(), "the server accepted the 0-RTT data")
+            while (round == 0 && crypto.tickets.size == 0) delay(5)
             conn.close(VarInt(0), ByteArray(0))
         }
         serverTask.join()

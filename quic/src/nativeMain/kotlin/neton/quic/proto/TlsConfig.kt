@@ -34,12 +34,13 @@ import neton.openssl.c.SSL_CTX
 import neton.openssl.c.SSL_CTX_free
 import neton.openssl.c.SSL_CTX_get_cert_store
 import neton.openssl.c.SSL_CTX_new
+import neton.openssl.c.SSL_CTX_ctrl
+import neton.openssl.c.SSL_CTX_sess_set_new_cb
 import neton.openssl.c.SSL_CTX_set_alpn_select_cb
 import neton.openssl.c.SSL_CTX_set_ciphersuites
 import neton.openssl.c.SSL_CTX_set_client_hello_cb
-import neton.openssl.c.SSL_CTX_set_max_early_data
-import neton.openssl.c.SSL_CTX_set_num_tickets
 import neton.openssl.c.SSL_CTX_set_options
+import neton.openssl.c.SSL_CTX_set_session_id_context
 import neton.openssl.c.SSL_CTX_set_verify
 import neton.openssl.c.SSL_CTX_use_cert_and_key
 import neton.openssl.c.SSL_VERIFY_FAIL_IF_NO_PEER_CERT
@@ -168,6 +169,8 @@ class TlsClientConfig private constructor(
     cipherSuites: List<CipherSuite>,
     groups: String?,
     @Suppress("UNUSED_PARAMETER") insecure: Boolean,
+    /** Send 0-RTT data when a session ticket allows it (rustls `enable_early_data`, which quinn sets). */
+    internal val enableEarlyData: Boolean,
 ) : CryptoClientConfig, AutoCloseable {
 
     /**
@@ -180,6 +183,8 @@ class TlsClientConfig private constructor(
      * @param groups the key exchange groups, in OpenSSL's list syntax (e.g. `"X25519:P-256"`); `null` keeps OpenSSL's
      *   default, which sends an X25519MLKEM768 (post-quantum hybrid) and an X25519 key share — a ClientHello of about
      *   1.5 KB, sent in two Initial datagrams. `"X25519"` fits the ClientHello in one.
+     * @param enableEarlyData send 0-RTT data when a session ticket from the server allows it (quinn: on). Session
+     *   tickets are kept in memory per server name, each used once (rustls's client session cache).
      */
     constructor(
         trustAnchors: Certificates,
@@ -188,11 +193,18 @@ class TlsClientConfig private constructor(
         clientKey: PrivateKey? = null,
         cipherSuites: List<CipherSuite> = CipherSuite.entries,
         groups: String? = null,
-    ) : this(trustAnchors, alpnProtocols, clientCertificate, clientKey, cipherSuites, groups, false)
+        enableEarlyData: Boolean = true,
+    ) : this(trustAnchors, alpnProtocols, clientCertificate, clientKey, cipherSuites, groups, false, enableEarlyData)
 
     internal val alpn: List<ByteArray> = validateAlpn(alpnProtocols)
     internal val alpnWire: ByteArray = alpnWire(alpn)
     internal val ctx: SslContextResource
+
+    /**
+     * Session tickets from servers, for resumption and 0-RTT (rustls `ClientSessionMemoryCache`). Tests share one
+     * between configurations, as quinn's tests change a rustls config's protocols and keep its resumption store.
+     */
+    internal var tickets = TicketCache()
 
     init {
         require((clientCertificate == null) == (clientKey == null)) { "a client certificate needs its private key" }
@@ -204,6 +216,9 @@ class TlsClientConfig private constructor(
                 SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)
             }
             if (clientCertificate != null) useIdentity(ctx, clientCertificate, clientKey!!)
+            // Tickets reach the session through the new-session callback; OpenSSL keeps no client cache of its own.
+            SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, (SSL_SESS_CACHE_CLIENT or SSL_SESS_CACHE_NO_INTERNAL_STORE).toLong(), null)
+            SSL_CTX_sess_set_new_cb(ctx, NEW_SESSION)
         })
     }
 
@@ -226,7 +241,8 @@ class TlsClientConfig private constructor(
             alpnProtocols: List<ByteArray> = emptyList(),
             cipherSuites: List<CipherSuite> = CipherSuite.entries,
             groups: String? = null,
-        ): TlsClientConfig = TlsClientConfig(null, alpnProtocols, null, null, cipherSuites, groups, true)
+            enableEarlyData: Boolean = true,
+        ): TlsClientConfig = TlsClientConfig(null, alpnProtocols, null, null, cipherSuites, groups, true, enableEarlyData)
     }
 }
 
@@ -240,6 +256,10 @@ class TlsClientConfig private constructor(
  *   no_application_protocol (120), as rustls does for QUIC.
  * @param groups the key exchange groups accepted, in OpenSSL's list syntax; `null` keeps OpenSSL's default (with the
  *   X25519MLKEM768 hybrid).
+ * @param earlyData accept 0-RTT data on resumed sessions (quinn sets rustls `max_early_data_size` to `u32::MAX`). The
+ *   server issues two session tickets per connection (OpenSSL's default; rustls sends two too) and keeps the sessions
+ *   in its cache; with early data on, OpenSSL's replay protection makes each ticket single-use (a second use falls back
+ *   to a full handshake), as rustls's stateful resumption does.
  */
 class TlsServerConfig(
     certificateChain: Certificates,
@@ -248,6 +268,7 @@ class TlsServerConfig(
     clientAuth: ClientAuth = ClientAuth.None,
     cipherSuites: List<CipherSuite> = CipherSuite.entries,
     groups: String? = null,
+    internal val earlyData: Boolean = true,
 ) : CryptoServerConfig, AutoCloseable {
     internal val alpn: List<ByteArray> = validateAlpn(alpnProtocols)
     internal val ctx: SslContextResource = SslContextResource(newQuicContext(cipherSuites, groups) { ctx ->
@@ -267,6 +288,11 @@ class TlsServerConfig(
         // nothing here points into this configuration (sessions outlive a closed configuration).
         SSL_CTX_set_alpn_select_cb(ctx, ALPN_SELECT, null)
         SSL_CTX_set_client_hello_cb(ctx, CLIENT_HELLO, null)
+        // Resumption needs a session ID context once client certificates are verified; one per configuration.
+        val sid = "neton-quic".encodeToByteArray()
+        check(sid.usePinned { SSL_CTX_set_session_id_context(ctx, it.addressOf(0).reinterpret(), sid.size.toUInt()) } == 1) {
+            "session id context: ${drainOpenSslErrors()}"
+        }
     })
 
     @Suppress("unused")
@@ -345,9 +371,59 @@ internal fun cipherSuiteOf(protocolId: Int): CipherSuite? = when (protocolId) {
 }
 
 private const val SSL_OP_NO_COMPRESSION = 0x20000uL // SSL_OP_BIT(17)
-private const val SSL_OP_NO_TICKET = 0x4000uL // SSL_OP_BIT(14)
+private const val SSL_CTRL_SET_SESS_CACHE_MODE = 44
+private const val SSL_SESS_CACHE_CLIENT = 0x0001
+private const val SSL_SESS_CACHE_NO_INTERNAL_STORE = 0x0300 // NO_INTERNAL_LOOKUP | NO_INTERNAL_STORE
 
-/** An SSL_CTX for QUIC: TLS 1.3 only, the given suites, no tickets / resumption / early data; [configure] adds the rest. */
+/** A session ticket a client keeps (rustls `Tls13ClientSessionValue` with its QUIC parameters). */
+internal class ClientTicket(
+    /** The SSL_SESSION, DER-encoded (i2d_SSL_SESSION). */
+    val session: ByteArray,
+    /** The server's transport parameters on the connection that issued it (the 0-RTT limits, RFC 9000 §7.4.1). */
+    val params: ByteArray?,
+    /** The ticket allows 0-RTT (max_early_data 0xffffffff, the only non-zero value QUIC permits). */
+    val earlyData: Boolean,
+)
+
+/**
+ * Tickets per server name, each used once (rustls `ClientSessionMemoryCache`: up to [PER_SERVER] per name, [SERVERS]
+ * names, the oldest name evicted first). A configuration can serve endpoints on several reactor threads, so access is
+ * serialized by a spin lock (every operation is a few map updates).
+ */
+internal class TicketCache {
+    private val lock = AtomicInt(0)
+    private val byServer = LinkedHashMap<String, ArrayDeque<ClientTicket>>()
+
+    private inline fun <T> locked(block: () -> T): T {
+        while (!lock.compareAndSet(0, 1)) { }
+        try { return block() } finally { lock.value = 0 }
+    }
+
+    fun add(server: String, ticket: ClientTicket) = locked {
+        val q = byServer.remove(server) ?: ArrayDeque()
+        q.addLast(ticket)
+        while (q.size > PER_SERVER) q.removeFirst()
+        byServer[server] = q
+        while (byServer.size > SERVERS) byServer.remove(byServer.keys.first())
+    }
+
+    /** The newest ticket for [server], removed (single use). */
+    fun take(server: String): ClientTicket? = locked {
+        val q = byServer[server] ?: return@locked null
+        val t = q.removeLastOrNull()
+        if (q.isEmpty()) byServer.remove(server)
+        t
+    }
+
+    internal val size: Int get() = locked { byServer.values.sumOf { it.size } }
+
+    private companion object {
+        const val PER_SERVER = 8
+        const val SERVERS = 256
+    }
+}
+
+/** An SSL_CTX for QUIC: TLS 1.3 only, the given suites; [configure] adds the rest (tickets and early data per side). */
 private inline fun newQuicContext(suites: List<CipherSuite>, groups: String?, configure: (CPointer<SSL_CTX>) -> Unit): CPointer<SSL_CTX> {
     require(suites.isNotEmpty()) { "no cipher suites" }
     require(groups == null || (groups.isNotEmpty() && '\u0000' !in groups)) { "invalid groups" }
@@ -355,9 +431,7 @@ private inline fun newQuicContext(suites: List<CipherSuite>, groups: String?, co
     val ctx = SSL_CTX_new(TLS_method()) ?: throw IllegalStateException("SSL_CTX_new failed: ${drainOpenSslErrors()}")
     try {
         check(neton_openssl_tls13_only(ctx) == 1) { "TLS 1.3 only: ${drainOpenSslErrors()}" }
-        SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET or SSL_OP_NO_COMPRESSION)
-        check(SSL_CTX_set_num_tickets(ctx, 0u) == 1) { "no tickets: ${drainOpenSslErrors()}" }
-        check(SSL_CTX_set_max_early_data(ctx, 0u) == 1) { "no early data: ${drainOpenSslErrors()}" }
+        SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION)
         val names = suites.distinct().joinToString(":") { it.openSslName }
         require(SSL_CTX_set_ciphersuites(ctx, names) == 1) { "cipher suites $names: ${drainOpenSslErrors()}" }
         if (groups != null) require(neton_tls_groups(ctx, groups) == 1) { "groups $groups: ${drainOpenSslErrors()}" }

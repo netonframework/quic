@@ -2,6 +2,8 @@
 
 package neton.quic.proto
 
+import kotlin.experimental.ExperimentalNativeApi
+import kotlin.native.ref.createCleaner
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.CPointerVar
@@ -46,6 +48,11 @@ import neton.openssl.c.OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET
 import neton.openssl.c.SSL
 import neton.openssl.c.SSL_CIPHER_get_protocol_id
 import neton.openssl.c.SSL_ERROR_WANT_READ
+import neton.openssl.c.SSL_SESSION
+import neton.openssl.c.SSL_SESSION_free
+import neton.openssl.c.SSL_SESSION_get0_alpn_selected
+import neton.openssl.c.SSL_SESSION_get0_cipher
+import neton.openssl.c.SSL_SESSION_get_max_early_data
 import neton.openssl.c.SSL_TLSEXT_ERR_ALERT_FATAL
 import neton.openssl.c.SSL_TLSEXT_ERR_OK
 import neton.openssl.c.SSL_client_hello_get0_ext
@@ -55,11 +62,13 @@ import neton.openssl.c.SSL_free
 import neton.openssl.c.SSL_get0_alpn_selected
 import neton.openssl.c.SSL_get0_peer_certificate
 import neton.openssl.c.SSL_get_current_cipher
+import neton.openssl.c.SSL_get_early_data_status
 import neton.openssl.c.SSL_get_error
 import neton.openssl.c.SSL_get_ex_data
 import neton.openssl.c.SSL_get_peer_cert_chain
 import neton.openssl.c.SSL_get_pending_cipher
 import neton.openssl.c.SSL_get_servername
+import neton.openssl.c.SSL_get_session
 import neton.openssl.c.SSL_is_init_finished
 import neton.openssl.c.SSL_new
 import neton.openssl.c.SSL_read
@@ -73,10 +82,12 @@ import neton.openssl.c.SSL_set_hostflags
 import neton.openssl.c.SSL_set_quic_tls_cbs
 import neton.openssl.c.SSL_set_quic_tls_early_data_enabled
 import neton.openssl.c.SSL_set_quic_tls_transport_params
+import neton.openssl.c.SSL_set_session
+import neton.openssl.c.SSL_set_shutdown
 import neton.openssl.c.X509
 import neton.openssl.c.X509_cmp
-import kotlin.experimental.ExperimentalNativeApi
-import kotlin.native.ref.createCleaner
+import neton.openssl.c.d2i_SSL_SESSION
+import neton.openssl.c.i2d_SSL_SESSION
 
 // The TLS 1.3 session for QUIC (quinn-proto `crypto/rustls.rs` `TlsSession`) on OpenSSL's third-party QUIC TLS
 // interface (`SSL_set_quic_tls_cbs`, OpenSSL 3.5+; used through openssl-kotlin's raw bindings). OpenSSL runs the
@@ -134,6 +145,9 @@ private const val LEVEL_NONE = 0
 private const val LEVEL_EARLY = 1
 private const val LEVEL_HANDSHAKE = 2
 private const val LEVEL_APPLICATION = 3
+private const val SSL_EARLY_DATA_ACCEPTED = 2
+private const val SSL_SENT_SHUTDOWN = 1
+private const val SSL_RECEIVED_SHUTDOWN = 2
 
 /** Largest record handed to OpenSSL at once (a TLS record's plaintext limit). */
 internal const val MAX_RECORD = 16384
@@ -152,7 +166,7 @@ private const val X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS = 0x4u
 private const val X509_CHECK_FLAG_NEVER_CHECK_SUBJECT = 0x20u
 
 /** Callbacks a test can make fail (C-boundary tests). */
-internal enum class TlsCallback { CRYPTO_SEND, CRYPTO_RECV_RCD, CRYPTO_RELEASE_RCD, YIELD_SECRET, GOT_TRANSPORT_PARAMS, ALERT, ALPN_SELECT, CLIENT_HELLO }
+internal enum class TlsCallback { CRYPTO_SEND, CRYPTO_RECV_RCD, CRYPTO_RELEASE_RCD, YIELD_SECRET, GOT_TRANSPORT_PARAMS, ALERT, ALPN_SELECT, CLIENT_HELLO, NEW_SESSION }
 
 /**
  * The state OpenSSL's callbacks work on, reached through a StableRef. It does not reference the [TlsSession], so the
@@ -198,6 +212,16 @@ internal class TlsCore(val side: Side, val serverAlpn: List<ByteArray>?) {
 
     /** The peer's transport parameters (copied). */
     var peerParams: ByteArray? = null
+
+    // ---- 0-RTT: the early traffic secret (client: write, server: read) and its suite; it changes no CRYPTO level ----
+    var earlySecret: ByteArray? = null
+    var earlySuite: CipherSuite? = null
+
+    /** Session tickets received (client), DER-encoded, with whether each allows 0-RTT; moved out after each call. */
+    val newTickets = ArrayList<Pair<ByteArray, Boolean>>()
+
+    /** Tickets that could not be kept (their callback failed); the connection is not affected. */
+    var droppedTickets = 0
 
     fun fail(t: Throwable) {
         if (failure == null) failure = t
@@ -266,13 +290,25 @@ internal class TlsCore(val side: Side, val serverAlpn: List<ByteArray>?) {
         if (outgoingBytes + len > MAX_OUTGOING) {
             throw TransportError.INTERNAL_ERROR("more than $MAX_OUTGOING bytes of handshake output pending")
         }
-        check(writeLevel != LEVEL_EARLY) { "0-RTT is disabled" }
         if (len == 0) return
         outgoing[writeLevel].addLast(buf.readBytes(len))
         outgoingBytes += len
     }
 
     fun yieldSecret(ssl: CPointer<SSL>, level: Int, direction: Int, secret: CPointer<UByteVar>, len: Int) {
+        if (level == LEVEL_EARLY) {
+            // The client's early write secret (with its ClientHello) or the server's early read secret (0-RTT
+            // accepted). CRYPTO data never travels at this level, so the CRYPTO levels stay as they are.
+            check(direction == (if (side == Side.Client) 1 else 0)) { "early secret in the wrong direction" }
+            val cipher = SSL_get_pending_cipher(ssl) ?: SSL_get_session(ssl)?.let { SSL_SESSION_get0_cipher(it) }
+            val suite = cipher?.let { cipherSuiteOf(SSL_CIPHER_get_protocol_id(it).toInt()) }
+                ?: throw TransportError.INTERNAL_ERROR("0-RTT cipher suite not usable with QUIC")
+            check(len == suite.hash.outputSize) { "a ${suite.name} secret has ${suite.hash.outputSize} bytes, got $len" }
+            earlySecret?.let { Crypto.wipe(it) }
+            earlySecret = secret.readBytes(len)
+            earlySuite = suite
+            return
+        }
         check(level == LEVEL_HANDSHAKE || level == LEVEL_APPLICATION) { "unexpected secret for protection level $level" }
         val cipher = SSL_get_pending_cipher(ssl) ?: SSL_get_current_cipher(ssl)
         val suite = cipher?.let { cipherSuiteOf(SSL_CIPHER_get_protocol_id(it).toInt()) }
@@ -297,6 +333,8 @@ internal class TlsCore(val side: Side, val serverAlpn: List<ByteArray>?) {
 
     /** Wipe the secrets and free the outstanding record; after the SSL is freed. */
     fun wipe() {
+        earlySecret?.let { Crypto.wipe(it) }
+        earlySecret = null
         for (a in arrayOf(readSecrets, writeSecrets)) {
             for (i in a.indices) {
                 a[i]?.let { Crypto.wipe(it) }
@@ -342,6 +380,15 @@ class TlsSession private constructor(
     private var failed: TransportError? = null
     private var nextSecrets: Secrets? = null
 
+    // ---- resumption and 0-RTT ----
+    /** Client: where received tickets go, and under which server name. */
+    private var ticketSink: TicketCache? = null
+    private var serverName: String? = null
+    /** Client resuming: the server's transport parameters remembered with the ticket (the 0-RTT limits). */
+    private var rememberedParams: ByteArray? = null
+    private var earlyKeys: EarlyKeys? = null
+    private var earlyAccepted = false
+
     // Kept in Kotlin so they stay available after the native session is released
     private var alpnSelected: ByteArray? = null
     private var sniSeen: String? = null
@@ -359,10 +406,23 @@ class TlsSession private constructor(
     /** The peer's certificate chain as presented, leaf first, as DER (`List<ByteArray>`, rustls `Vec<CertificateDer>`). */
     override fun peerIdentity(): Any? = peerCerts?.map { it.copyOf() }
 
-    /** 0-RTT is not supported yet (a later, separate batch). */
-    override fun earlyCrypto(): EarlyKeys? = null
+    /**
+     * The 0-RTT keys (rustls `zero_rtt_keys`): a client's once it resumed a session whose ticket allows early data, a
+     * server's once it accepted the client's early data. Derived once; the secret is then wiped.
+     */
+    override fun earlyCrypto(): EarlyKeys? {
+        earlyKeys?.let { return it }
+        val secret = core.earlySecret ?: return null
+        val suite = core.earlySuite!!
+        val keys = EarlyKeys(headerKey(suite, secret), packetKey(suite, secret))
+        Crypto.wipe(secret)
+        core.earlySecret = null
+        earlyKeys = keys
+        return keys
+    }
 
-    override fun earlyDataAccepted(): Boolean? = if (side == Side.Client) false else null
+    /** Client: whether the server accepted the 0-RTT data (known once the handshake completed); null on servers. */
+    override fun earlyDataAccepted(): Boolean? = if (side == Side.Client) earlyAccepted else null
 
     override val isHandshaking: Boolean get() = !handshakeComplete
 
@@ -383,7 +443,8 @@ class TlsSession private constructor(
     }
 
     override fun transportParameters(): TransportParameters? {
-        val bytes = core.peerParams ?: return null
+        // A client resuming uses the ones remembered with its ticket until the server's arrive (rustls).
+        val bytes = core.peerParams ?: rememberedParams ?: return null
         return try {
             TransportParameters.read(side, Reader(bytes))
         } catch (e: TransportParameterError) {
@@ -460,6 +521,10 @@ class TlsSession private constructor(
             closeRequested = true
             return
         }
+        // QUIC ends a connection with CONNECTION_CLOSE, never TLS's close_notify: tell OpenSSL this one ended cleanly,
+        // or SSL_free drops the session of the last ticket from the server's cache (ssl_clear_bad_session), and a
+        // client resuming with that ticket gets a full handshake. rustls never forgets a session on close.
+        if (handshakeComplete) ssl?.let { SSL_set_shutdown(it, SSL_SENT_SHUTDOWN or SSL_RECEIVED_SHUTDOWN) }
         native.release()
         nextSecrets?.wipe()
         nextSecrets = null
@@ -482,6 +547,7 @@ class TlsSession private constructor(
         val s = ssl ?: throw TransportError.INTERNAL_ERROR("TLS session closed")
         while (true) {
             val wasComplete = handshakeComplete
+            val inputBefore = core.incomingBytes
             ERR_clear_error()
             inCall = true
             val ret: Int
@@ -511,8 +577,15 @@ class TlsSession private constructor(
                     },
                 )
             }
+            // A server accepting early data returns 1 once its own Finished is out, to let it read 0-RTT data: the
+            // handshake goes on until the client's Finished. rustls reports a handshake complete only after that.
+            if (!wasComplete && ret == 1 && SSL_is_init_finished(s) != 1) {
+                if (core.incomingBytes in 1 until inputBefore) continue
+                return
+            }
             if (!wasComplete && ret == 1) {
                 handshakeComplete = true
+                if (side == Side.Client) earlyAccepted = SSL_get_early_data_status(s) == SSL_EARLY_DATA_ACCEPTED
                 if (side == Side.Client && clientAlpnOffered && alpnSelected == null) {
                     // rustls for QUIC: an ALPN offer must be answered
                     throw failWith(
@@ -528,6 +601,15 @@ class TlsSession private constructor(
 
     /** Copy what the application may ask for later: the ALPN protocol, the SNI, the peer's certificates. */
     private fun capturePeerState(s: CPointer<SSL>) {
+        // Session tickets (client): kept with the server's transport parameters for the next connection.
+        if (core.newTickets.isNotEmpty()) {
+            val sink = ticketSink
+            val name = serverName
+            if (sink != null && name != null) {
+                for ((der, early) in core.newTickets) sink.add(name, ClientTicket(der, core.peerParams?.copyOf(), early))
+            }
+            core.newTickets.clear()
+        }
         if (alpnSelected == null) {
             memScoped {
                 val data = alloc<CPointerVar<UByteVar>>()
@@ -567,6 +649,9 @@ class TlsSession private constructor(
                 ERR_clear_error()
                 SSL_set_connect_state(s)
                 setServerName(s, serverName)
+                session.ticketSink = config.tickets
+                session.serverName = serverName
+                config.tickets.take(serverName)?.let { session.resume(s, it, config.enableEarlyData, config.alpn) }
                 if (config.alpnWire.isNotEmpty()) {
                     val r = config.alpnWire.usePinned { SSL_set_alpn_protos(s, it.addressOf(0).reinterpret(), config.alpnWire.size.convert()) }
                     check(r == 0) { "SSL_set_alpn_protos: ${drainOpenSslErrors()}" }
@@ -587,10 +672,21 @@ class TlsSession private constructor(
             config.ctx.use { ctx -> session.open(ctx, params) }
             try {
                 SSL_set_accept_state(session.ssl!!)
+                // max_early_data 0xffffffff for this session; OpenSSL then also turns on its replay protection.
+                if (config.earlyData) check(SSL_set_quic_tls_early_data_enabled(session.ssl!!, 1) == 1) { "early data: ${drainOpenSslErrors()}" }
                 return session
             } catch (t: Throwable) {
                 session.close()
                 throw t
+            }
+        }
+
+        /** The SSL_SESSION in [der], or null when it no longer parses. */
+        private fun parseSession(der: ByteArray): CPointer<SSL_SESSION>? = memScoped {
+            der.usePinned { pinned ->
+                val p = alloc<CPointerVar<UByteVar>>()
+                p.value = pinned.addressOf(0).reinterpret()
+                d2i_SSL_SESSION(null, p.ptr, der.size.convert())
             }
         }
 
@@ -613,6 +709,38 @@ class TlsSession private constructor(
 
         private fun looksLikeIp(s: String): Boolean =
             ':' in s || (s.count { it == '.' } == 3 && s.all { it.isDigit() || it == '.' })
+    }
+
+    /**
+     * Resume [ticket] (rustls with a cached session): offer it, use the server parameters remembered with it until the
+     * server's arrive, and send 0-RTT data when it allows early data and [enableEarlyData]. A ticket that no longer
+     * parses is dropped and the handshake is a full one.
+     */
+    private fun resume(s: CPointer<SSL>, ticket: ClientTicket, enableEarlyData: Boolean, offeredAlpn: List<ByteArray>) {
+        val sess = parseSession(ticket.session) ?: run { drainOpenSslErrors(); return }
+        try {
+            if (SSL_set_session(s, sess) != 1) { drainOpenSslErrors(); return }
+        } finally {
+            SSL_SESSION_free(sess)                          // the SSL holds its own reference
+        }
+        rememberedParams = ticket.params
+        // ⚖️ OpenSSL fails the handshake when the ticket's protocol is not among those offered now
+        // (INCONSISTENT_EARLY_DATA_ALPN); rustls sends the 0-RTT data and the server rejects it. Here the session is
+        // resumed without 0-RTT, so a client that changed its protocols still connects.
+        if (!alpnOffered(s, offeredAlpn)) return
+        // OpenSSL refuses (0) unless the session's max_early_data is 0xffffffff: then there is no 0-RTT, only resumption.
+        if (enableEarlyData && ticket.earlyData && SSL_set_quic_tls_early_data_enabled(s, 1) != 1) drainOpenSslErrors()
+    }
+
+    /** Whether the protocol the resumed session negotiated (if any) is among [offered]. */
+    private fun alpnOffered(s: CPointer<SSL>, offered: List<ByteArray>): Boolean = memScoped {
+        val sess = SSL_get_session(s) ?: return@memScoped true
+        val data = alloc<CPointerVar<UByteVar>>()
+        val len = alloc<ULongVar>()
+        SSL_SESSION_get0_alpn_selected(sess, data.ptr, len.ptr)
+        val p = data.value ?: return@memScoped true
+        val selected = p.readBytes(len.value.toInt())
+        offered.any { it.contentEquals(selected) }
     }
 
     /** Create the SSL and wire the callbacks; on failure everything created so far is released. */
@@ -792,5 +920,44 @@ internal val CLIENT_HELLO = staticCFunction { ssl: CPointer<SSL>?, al: CPointer<
         r == 1 && ok == 1 -> 1
         r == 1 -> { al?.pointed?.value = ALERT_NO_APPLICATION_PROTOCOL; 0 }
         else -> { al?.pointed?.value = ALERT_INTERNAL_ERROR; 0 }
+    }
+}
+
+/**
+ * A session ticket arrived (client; SSL_CTX_sess_set_new_cb): keep it DER-encoded on the core; the session moves it
+ * into its configuration's [TicketCache] after the call. Returns 0: OpenSSL keeps ownership of the SSL_SESSION.
+ * Unlike the other callbacks a failure here does not fail the connection: the ticket is dropped and counted (a
+ * resumption cache is an optimisation; rustls does not fail a connection over storing a ticket either).
+ */
+internal val NEW_SESSION = staticCFunction { ssl: CPointer<SSL>?, sess: CPointer<SSL_SESSION>? ->
+    try {
+        val core = SSL_get_ex_data(ssl, 0)?.asStableRef<TlsCore>()?.get()
+        if (core != null && !core.released) {
+            try {
+                core.checkInjected(TlsCallback.NEW_SESSION)
+                keepTicket(core, sess)
+            } catch (t: Throwable) {
+                core.droppedTickets++
+            }
+        }
+    } catch (t: Throwable) {
+    }
+    0
+}
+
+private fun keepTicket(core: TlsCore, sess: CPointer<SSL_SESSION>?) {
+    run {
+        val n = i2d_SSL_SESSION(sess, null)
+        if (n > 0) {
+            val der = ByteArray(n)
+            memScoped {
+                der.usePinned { pinned ->
+                    val p = alloc<CPointerVar<UByteVar>>()
+                    p.value = pinned.addressOf(0).reinterpret()
+                    check(i2d_SSL_SESSION(sess, p.ptr) == n) { "i2d_SSL_SESSION" }
+                }
+            }
+            core.newTickets += der to (SSL_SESSION_get_max_early_data(sess) == 0xffffffffu)
+        }
     }
 }
