@@ -914,3 +914,43 @@ TLS 1.3（QUIC 接口，§4，待决）       com.netonstream:io（反应器、�
 - **仍未解决**：Windows 上不丢包后传 4 MiB 仍需 0.55–0.85 s（Linux 0.10–0.17 s、macOS 0.31 s），发送预算的让出 1–19 次（Linux 145 次）：发送端
   不忙，瓶颈多半在接收侧（Windows 每次系统调用收一个数据报，Linux `recvmmsg` 一次 32 个；同一反应器上的接收轮次有 50 µs 的时间预算）。作为
   性能项，需要在 Windows 上做剖析后再改；`DriverBudgetTest` 在 Windows IOCP 替身上只让出 1 次，处在边界上。
+
+### 11.14 真实 TLS 上的会话恢复与 0-RTT（2026-10-08）
+此前真实 TLS 会话拒绝 0-RTT（§11.9、§11.11，相关测试在真实 TLS 下跳过）。参照 quinn 0.11 的做法——quinn 把票据、早期数据与接受判定都交给
+rustls——在 OpenSSL 4.0.2 的第三方 QUIC TLS 接口上实现（`TlsSession.kt`、`TlsConfig.kt`；所需函数 openssl-kotlin 的绑定都已有，未改动它）。
+- **客户端**：`TlsClientConfig(enableEarlyData = true)`（默认开启，quinn 设置 rustls `enable_early_data`）。客户端 `SSL_CTX` 设为客户端会话缓存
+  且不在 OpenSSL 内部存储，票据经 `SSL_CTX_sess_set_new_cb` 以 DER 形式交给会话，再连同本连接收到的服务端传输参数与"是否允许早期数据"
+  （`max_early_data == 0xffffffff`）存入配置的 `TicketCache`：按服务器名，每名至多 8 张、至多 256 个名字，取最新的一张、用后即弃（与 rustls
+  `ClientSessionMemoryCache` 相同）。新连接取到票据时 `SSL_set_session`，在服务端参数到达之前 `transportParameters()` 返回票据记下的参数
+  （RFC 9000 §7.4.1），票据允许时 `SSL_set_quic_tls_early_data_enabled(1)`。OpenSSL 在写完 ClientHello 后给出 EARLY 级别的写密钥，由它导出
+  0-RTT 的报文与头部保护密钥；该级别不改变 CRYPTO 数据所用的级别。握手完成时以 `SSL_get_early_data_status` 判定 `earlyDataAccepted`。
+- ⚖️ **ALPN 变化**：票据所协商的协议不在本次提议中时，OpenSSL 客户端会以 INCONSISTENT_EARLY_DATA_ALPN 使握手失败；rustls 照发 0-RTT、由服务端
+  拒绝。本库此时只恢复会话、不发 0-RTT，改了协议的客户端照常连接（`zeroRttRejection` 在真实 TLS 下据此断言）。
+- **服务端**：`TlsServerConfig(earlyData = true)`（默认开启，quinn 把 rustls `max_early_data_size` 设为 `u32::MAX`）：每个会话
+  `SSL_set_quic_tls_early_data_enabled(1)`，OpenSSL 随之把 `max_early_data` 设为 0xffffffff 并启用重放保护——票据有状态、单次使用（第二次使用
+  回退为完整握手，0-RTT 被拒绝），与 rustls 有状态恢复相同。每个连接签发两张票据（OpenSSL 默认；rustls 也是两张）。设置 session id context，
+  使启用客户端证书时也能恢复。与 rustls 一样，服务端只比较 TLS 层的条件（版本、密码套件、ALPN、票据新鲜度），不比较 QUIC 传输参数。
+- **途中发现并修正的两个缺陷**：
+  - 服务端缓存丢失最新票据的会话：`SSL_free` 对"握手完成但未发送 close_notify"的连接调用 `ssl_clear_bad_session`，把它当前的会话——最后
+    一张票据的会话——从服务端缓存删除；QUIC 以 CONNECTION_CLOSE 结束，从不发送 close_notify。客户端用最新的票据恢复，于是总是完整握手
+    （诊断：服务端缓存中 1 个会话、客户端收到 2 张票据；改取最早的一张即恢复成功）。修正：握手完成过的会话在释放前 `SSL_set_shutdown(SENT |
+    RECEIVED)`；rustls 不会因连接结束而遗忘会话。
+  - 服务端过早地认为握手完成：开启早期数据的服务端，`SSL_do_handshake` 在发出自己的 Finished 后即返回 1（以便读取早期数据），握手要到客户端
+    的 Finished 才完成。旧代码据此把握手标为完成、连接进入已建立状态，1-RTT 读密钥却尚未到达，数据空间没有密钥——大证书的测试在 MTU 探测处
+    空指针，丢包与多连接测试超时。修正：以 `SSL_is_init_finished` 判定完成；返回 1 而未完成时，有进展且仍有输入就继续驱动，否则等待输入。
+- **票据回调失败不影响连接**：与其他回调不同，`NEW_SESSION` 的失败只丢弃这张票据并计数（缓存只是优化；rustls 也不会因存票据失败而断开）。
+- **测试**：quinn 的 0-RTT 测试（`ConnectionTest` 四个、`DriverTest.zeroRtt`）在真实 TLS 下运行（取消跳过；缓冲大小两个改用单数据报
+  ClientHello，按数据报计数）；新增 `RealTlsConnectionTest.zeroRttIsAcceptedOnReconnect`、`aReplayedTicketGetsItsZeroRttRejected`（同一张票据用
+  两次：第二次 0-RTT 被拒绝，0-RTT 流作废后同一 ID 重新打开、数据在 1-RTT 重发）、`zeroRttCanBeTurnedOffOnEitherSide`，
+  `RealTlsDriverTest.zeroRttThroughTheDriver`（第二次连接以 `into0Rtt` 发送并确认被接受；第一次连接等票据到达后再关闭，否则票据可能尚未
+  到达——quinn 与 rustls 相同）。macOS 全量两种 TLS 模式各 605 个通过。
+- **与 quinn 互通**（`interop/quinn-peer`，quinn 客户端开启 `enable_early_data`、服务端 `max_early_data_size = u32::MAX`）：本库客户端以 quinn
+  （rustls）签发的票据向 quinn 服务端发送 0-RTT，quinn 客户端以本库（OpenSSL）签发的票据向本库服务端发送 0-RTT，两个方向都被接受；脚本要求
+  两端都报告 0-RTT 被接受。服务端一侧以 `has0rtt()` 判定（quinn 的 `accepted_0rtt` 只是客户端视角）。互通从此在 GitHub Actions 上运行（Linux，
+  epoll 与 io_uring 各一次，quinn 端由 `cargo build` 构建），11 项全部通过。
+- **CI**（run 37717311830）：全目标编译（首轮在 mingwX64 失败：`SSL_CTX_ctrl` 的 C `long` 在 Windows 上是 32 位，改为按平台的
+  `sslCtxSetSessionCacheMode`）、Linux 两项、Windows IOCP 两种 TLS 模式（各 608 个）、macOS 真实 TLS、两项互通通过；macOS 替身的
+  `LossyDriverTest.handshakeUnderRandomLoss` 与 Windows WSAPoll 的 `ManyConnectionsTest` 各一次超时（均在替身 TLS 上，与本节改动的代码无关；
+  前者是空闲超时：30% 双向丢包下多数据报的握手数据组常被连续丢失，PTO 逐次翻倍，连续六七次即超过默认 30 s 的空闲时限；本机每个种子 2–3 s、
+  连续 10 次通过。该测试验证的是丢包下完成握手而非空闲时限，改为 120 s 空闲时限并注明原因。后者未复现，记为待观察）。
+
