@@ -1,5 +1,6 @@
 //! quinn echo server: `server <listen addr> <cert.pem> <key.pem> [connections]`.
 //! Echoes every bidirectional stream, each echo in a new key phase forced 300 ms after the stream was read.
+//! Accepts 0-RTT from clients holding one of its tickets.
 
 #[path = "../common.rs"]
 mod common;
@@ -21,12 +22,16 @@ async fn main() -> Result<()> {
         .with_no_client_auth()
         .with_single_cert(common::certs(&args[2])?, common::key(&args[3])?)?;
     tls.alpn_protocols = vec![common::ALPN.to_vec()];
+    // 0-RTT (QUIC allows only 0 or u32::MAX); tickets and the stateful session cache are rustls's defaults
+    tls.max_early_data_size = u32::MAX;
     let cfg = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let endpoint = quinn::Endpoint::server(cfg, listen)?;
     eprintln!("[quinn interop] server listening on {}", endpoint.local_addr()?);
 
     for n in 0..conns {
         let Some(incoming) = endpoint.accept().await else { break };
+        // A client with a ticket sends 0-RTT data, which the connection accepts during the handshake (into_0rtt is
+        // only needed to answer before the handshake completes)
         let conn = match incoming.await {
             Ok(c) => c,
             Err(e) => {

@@ -1,6 +1,8 @@
 //! quinn echo client: `client <server addr> <server name> <ca.pem> [streams] [alpn]`.
 //! Opens streams one after another, each echoed and compared, each in a new key phase forced 300 ms after the previous echo; closes with 0x42.
 //! With a wrong CA or ALPN the connection error is printed and the exit status is 2.
+//! With ZERO_RTT=1 it then connects again with a ticket from the first connection and sends one stream in 0-RTT; the exit
+//! status is 3 when 0-RTT was not possible or the server rejected it.
 
 #[path = "../common.rs"]
 mod common;
@@ -28,6 +30,7 @@ async fn main() -> Result<()> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![alpn];
+    tls.enable_early_data = true;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?)));
 
@@ -71,6 +74,31 @@ async fn main() -> Result<()> {
         s.path.sent_packets, s.path.lost_packets
     );
     conn.close(0x42u32.into(), b"done");
+    if std::env::var("ZERO_RTT").as_deref() == Ok("1") {
+        let connecting = endpoint.connect(addr, name)?;
+        let (conn, accepted) = match connecting.into_0rtt() {
+            Ok(x) => x,
+            Err(_) => {
+                eprintln!("[quinn interop] client 0-RTT: no ticket allowed 0-RTT");
+                std::process::exit(3);
+            }
+        };
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let msg = common::data(5_000, 99);
+        send.write_all(&msg).await?;
+        send.finish()?;
+        let back = recv.read_to_end(1 << 20).await?;
+        if back != msg {
+            bail!("0-RTT stream: echo differs");
+        }
+        let ok = accepted.await;
+        eprintln!("[quinn interop] client 0-RTT: stream echoed, 0-RTT accepted {ok}");
+        conn.close(0x42u32.into(), b"done");
+        if !ok {
+            endpoint.wait_idle().await;
+            std::process::exit(3);
+        }
+    }
     endpoint.wait_idle().await;
     eprintln!("[quinn interop] client closed: {:?}", conn.close_reason());
     Ok(())

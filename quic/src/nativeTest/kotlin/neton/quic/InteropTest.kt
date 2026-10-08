@@ -30,6 +30,7 @@ import platform.posix.fread
 import platform.posix.getenv
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 import kotlin.time.Duration.Companion.seconds
@@ -48,6 +49,10 @@ import kotlin.time.Duration.Companion.seconds
  *   another, each echoed and compared, each in a new key phase forced 300 ms after the previous echo; close with
  *   code 0x42. The pauses let each update be discarded (3 PTO) before the other side's, so none is skipped as
  *   concurrent and each is carried by data.
+ *
+ * With `NETON_QUIC_INTEROP_ZERO_RTT=1` the client then connects again with a session ticket from the first connection and
+ * sends one more stream in 0-RTT (SPEC §11.14); it fails unless the server accepted the 0-RTT data. The server logs, per
+ * connection, whether it accepted 0-RTT.
  *
  * ALPN is `neton-interop`. Certificates are verified against the given CA (no insecure mode).
  */
@@ -129,10 +134,12 @@ class InteropTest {
             val reason = conn.closed()
             echo.join()
             val inner = conn.state.inner
-            log("conn $n: closed: $reason; streams echoed $streams; key updates ${inner.keyUpdates} (${inner.peerKeyUpdates} by the peer); lost packets ${conn.stats().path.lostPackets}")
+            log("conn $n: closed: $reason; streams echoed $streams; key updates ${inner.keyUpdates} (${inner.peerKeyUpdates} by the peer); 0-RTT accepted ${inner.has0rtt()}; lost packets ${conn.stats().path.lostPackets}")
             assertTrue(streams > 0)
             assertTrue(inner.keyUpdates - inner.peerKeyUpdates == streams.toLong(), "one key update of ours per stream")
-            assertTrue(inner.peerKeyUpdates >= 1, "a key update of the peer was accepted")
+            // The peer's 0-RTT connection carries one stream and no key update of its own
+            // (quinn's accepted_0rtt is the client's view; on a server, has_0rtt says it accepted 0-RTT)
+            if (!inner.has0rtt()) assertTrue(inner.peerKeyUpdates >= 1, "a key update of the peer was accepted")
         }
         assertTrue(served > 0, "no connection was served")
         endpoint.waitIdle()
@@ -186,14 +193,35 @@ class InteropTest {
         }
         val inner = conn.state.inner
         log("client echoed $streams streams, $total bytes; key updates ${inner.keyUpdates} (${inner.peerKeyUpdates} by the peer); lost packets ${conn.stats().path.lostPackets}")
+        val zeroRtt = env("NETON_QUIC_INTEROP_ZERO_RTT") == "1"
+        // Tickets come after the handshake; long since, after the streams above
+        while (zeroRtt && tls.tickets.size == 0) kotlinx.coroutines.delay(10)
         conn.close(VarInt(0x42), "done".encodeToByteArray())
         val reason = conn.closed()
         log("client closed: $reason")
+        if (zeroRtt) zeroRttAgain(endpoint, name)
         endpoint.waitIdle()
         endpoint.close()
         assertTrue(inner.keyUpdates - inner.peerKeyUpdates == streams.toLong(), "one key update of ours per stream")
         assertTrue(inner.peerKeyUpdates >= 1, "a key update of the peer was accepted")
         assertTrue(reason is ConnectionError.LocallyClosed, "$reason")
         log("client done")
+    }
+
+    /** Connect again with a ticket of the first connection, send one stream in 0-RTT, check the echo and the acceptance. */
+    private suspend fun kotlinx.coroutines.CoroutineScope.zeroRttAgain(endpoint: Endpoint, name: String) {
+        val connecting = endpoint.connect(address(env("NETON_QUIC_INTEROP_ADDR")!!), name)
+        val (conn, accepted) = assertNotNull(connecting.into0Rtt(), "0-RTT with a ticket from the first connection")
+        val (send, recv) = conn.openBi()
+        val msg = genData(5_000, 99)
+        val writer = launch { send.writeAll(msg); send.finish() }
+        val back = recv.readToEnd()
+        writer.join()
+        assertContentEquals(msg, back, "0-RTT stream")
+        val ok = accepted.await()
+        log("client 0-RTT: stream echoed, 0-RTT accepted $ok")
+        assertTrue(ok, "the server accepted the 0-RTT data")
+        conn.close(VarInt(0x42), "done".encodeToByteArray())
+        conn.closed()
     }
 }

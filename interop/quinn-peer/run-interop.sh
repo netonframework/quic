@@ -22,30 +22,38 @@ rejected() {
   else echo "== FAIL $4 (exit $1, expected a failure with '$3' in $2)"; FAILS=$((FAILS + 1)); fi
 }
 
-# 1. neton client -> quinn server
-RUST_LOG=quinn_proto::connection=trace $Q/server 127.0.0.1:$P $C/server.pem $C/server.key 1 > logs/1-quinn-server.log 2>&1 &
+# logged <log> <text> <case>: the log of a case that exited 0 must also show <text> (e.g. that 0-RTT was accepted).
+logged() {
+  if grep -q "$2" "$1"; then echo "== PASS $3"; else echo "== FAIL $3 (no '$2' in $1)"; FAILS=$((FAILS + 1)); fi
+}
+
+# 1. neton client -> quinn server; then the neton client again, with a ticket, in 0-RTT
+RUST_LOG=quinn_proto::connection=trace $Q/server 127.0.0.1:$P $C/server.pem $C/server.key 2 > logs/1-quinn-server.log 2>&1 &
 QPID=$!
 sleep 1
-NETON_QUIC_INTEROP=client NETON_QUIC_INTEROP_ADDR=127.0.0.1:$P NETON_QUIC_INTEROP_CA=$C/ca.pem \
+NETON_QUIC_INTEROP=client NETON_QUIC_INTEROP_ADDR=127.0.0.1:$P NETON_QUIC_INTEROP_CA=$C/ca.pem NETON_QUIC_INTEROP_ZERO_RTT=1 \
   $K --ktest_filter="$F" > logs/1-neton-client.log 2>&1
 R1=$?
 for i in $(seq 1 30); do kill -0 $QPID 2>/dev/null || break; sleep 1; done
 kill $QPID 2>/dev/null
 expect ok $R1 "1. neton client -> quinn server"
+logged logs/1-neton-client.log "0-RTT accepted true" "1. neton client -> quinn server: 0-RTT with a quinn ticket"
 grep -h "interop\]" logs/1-neton-client.log logs/1-quinn-server.log
 echo "quinn 'executing key update' traces: $(grep -c 'executing key update' logs/1-quinn-server.log)"
 
-# 2. quinn client -> neton server
+# 2. quinn client -> neton server; then the quinn client again, with a ticket, in 0-RTT
 NETON_QUIC_INTEROP=server NETON_QUIC_INTEROP_ADDR=127.0.0.1:$((P+1)) NETON_QUIC_INTEROP_CERT=$C/server.pem \
-  NETON_QUIC_INTEROP_KEY=$C/server.key NETON_QUIC_INTEROP_CONNS=1 $K --ktest_filter="$F" > logs/2-neton-server.log 2>&1 &
+  NETON_QUIC_INTEROP_KEY=$C/server.key NETON_QUIC_INTEROP_CONNS=2 $K --ktest_filter="$F" > logs/2-neton-server.log 2>&1 &
 NPID=$!
 sleep 2
-RUST_LOG=quinn_proto::connection=trace $Q/client 127.0.0.1:$((P+1)) localhost $C/ca.pem 8 > logs/2-quinn-client.log 2>&1
+ZERO_RTT=1 RUST_LOG=quinn_proto::connection=trace $Q/client 127.0.0.1:$((P+1)) localhost $C/ca.pem 8 > logs/2-quinn-client.log 2>&1
 R2=$?
 wait $NPID
 R2N=$?
 expect ok $R2 "2. quinn client -> neton server (quinn)"
 expect ok $R2N "2. quinn client -> neton server (neton)"
+logged logs/2-quinn-client.log "0-RTT accepted true" "2. quinn client -> neton server: 0-RTT with a neton ticket (quinn)"
+logged logs/2-neton-server.log "0-RTT accepted true" "2. quinn client -> neton server: 0-RTT with a neton ticket (neton)"
 grep -h "interop\]" logs/2-quinn-client.log logs/2-neton-server.log
 grep -h "OK \]\|FAILED \]" logs/2-neton-server.log | head -2
 echo "quinn 'executing key update' traces: $(grep -c 'executing key update' logs/2-quinn-client.log)"
