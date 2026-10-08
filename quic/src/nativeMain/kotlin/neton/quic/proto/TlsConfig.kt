@@ -37,6 +37,7 @@ import neton.openssl.c.SSL_CTX_new
 import neton.openssl.c.SSL_CTX_sess_set_new_cb
 import neton.openssl.c.SSL_CTX_set_alpn_select_cb
 import neton.openssl.c.SSL_CTX_set_ciphersuites
+import neton.openssl.c.SSL_CTX_set_keylog_callback
 import neton.openssl.c.SSL_CTX_set_client_hello_cb
 import neton.openssl.c.SSL_CTX_set_options
 import neton.openssl.c.SSL_CTX_set_session_id_context
@@ -170,6 +171,8 @@ class TlsClientConfig private constructor(
     @Suppress("UNUSED_PARAMETER") insecure: Boolean,
     /** Send 0-RTT data when a session ticket allows it (rustls `enable_early_data`, which quinn sets). */
     internal val enableEarlyData: Boolean,
+    /** Where the sessions' secrets go (rustls `key_log`); none by default. */
+    internal val keyLog: KeyLog?,
 ) : CryptoClientConfig, AutoCloseable {
 
     /**
@@ -184,6 +187,7 @@ class TlsClientConfig private constructor(
      *   1.5 KB, sent in two Initial datagrams. `"X25519"` fits the ClientHello in one.
      * @param enableEarlyData send 0-RTT data when a session ticket from the server allows it (quinn: on). Session
      *   tickets are kept in memory per server name, each used once (rustls's client session cache).
+     * @param keyLog receives each session's secrets (rustls `key_log`, e.g. [KeyLogFile]); `null` logs nothing.
      */
     constructor(
         trustAnchors: Certificates,
@@ -193,7 +197,8 @@ class TlsClientConfig private constructor(
         cipherSuites: List<CipherSuite> = CipherSuite.entries,
         groups: String? = null,
         enableEarlyData: Boolean = true,
-    ) : this(trustAnchors, alpnProtocols, clientCertificate, clientKey, cipherSuites, groups, false, enableEarlyData)
+        keyLog: KeyLog? = null,
+    ) : this(trustAnchors, alpnProtocols, clientCertificate, clientKey, cipherSuites, groups, false, enableEarlyData, keyLog)
 
     internal val alpn: List<ByteArray> = validateAlpn(alpnProtocols)
     internal val alpnWire: ByteArray = alpnWire(alpn)
@@ -218,6 +223,7 @@ class TlsClientConfig private constructor(
             // Tickets reach the session through the new-session callback; OpenSSL keeps no client cache of its own.
             sslCtxSetSessionCacheMode(ctx, SSL_SESS_CACHE_CLIENT or SSL_SESS_CACHE_NO_INTERNAL_STORE)
             SSL_CTX_sess_set_new_cb(ctx, NEW_SESSION)
+            if (keyLog != null) SSL_CTX_set_keylog_callback(ctx, KEY_LOG)
         })
     }
 
@@ -241,7 +247,8 @@ class TlsClientConfig private constructor(
             cipherSuites: List<CipherSuite> = CipherSuite.entries,
             groups: String? = null,
             enableEarlyData: Boolean = true,
-        ): TlsClientConfig = TlsClientConfig(null, alpnProtocols, null, null, cipherSuites, groups, true, enableEarlyData)
+            keyLog: KeyLog? = null,
+        ): TlsClientConfig = TlsClientConfig(null, alpnProtocols, null, null, cipherSuites, groups, true, enableEarlyData, keyLog)
     }
 }
 
@@ -259,6 +266,7 @@ class TlsClientConfig private constructor(
  *   server issues two session tickets per connection (OpenSSL's default; rustls sends two too) and keeps the sessions
  *   in its cache; with early data on, OpenSSL's replay protection makes each ticket single-use (a second use falls back
  *   to a full handshake), as rustls's stateful resumption does.
+ * @param keyLog receives each session's secrets (rustls `key_log`, e.g. [KeyLogFile]); `null` logs nothing.
  */
 class TlsServerConfig(
     certificateChain: Certificates,
@@ -268,6 +276,7 @@ class TlsServerConfig(
     cipherSuites: List<CipherSuite> = CipherSuite.entries,
     groups: String? = null,
     internal val earlyData: Boolean = true,
+    internal val keyLog: KeyLog? = null,
 ) : CryptoServerConfig, AutoCloseable {
     internal val alpn: List<ByteArray> = validateAlpn(alpnProtocols)
     internal val ctx: SslContextResource = SslContextResource(newQuicContext(cipherSuites, groups) { ctx ->
@@ -287,6 +296,7 @@ class TlsServerConfig(
         // nothing here points into this configuration (sessions outlive a closed configuration).
         SSL_CTX_set_alpn_select_cb(ctx, ALPN_SELECT, null)
         SSL_CTX_set_client_hello_cb(ctx, CLIENT_HELLO, null)
+        if (keyLog != null) SSL_CTX_set_keylog_callback(ctx, KEY_LOG)
         // Resumption needs a session ID context once client certificates are verified; one per configuration.
         val sid = "neton-quic".encodeToByteArray()
         check(sid.usePinned { SSL_CTX_set_session_id_context(ctx, it.addressOf(0).reinterpret(), sid.size.toUInt()) } == 1) {

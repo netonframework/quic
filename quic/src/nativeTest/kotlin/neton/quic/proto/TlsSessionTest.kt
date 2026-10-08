@@ -6,6 +6,9 @@ import kotlinx.cinterop.CPointerVar
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.ULongVar
 import kotlinx.cinterop.alloc
+import kotlinx.cinterop.allocArray
+import kotlinx.cinterop.readBytes
+import kotlinx.cinterop.toKString
 import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.ptr
@@ -240,6 +243,98 @@ class TlsSessionTest {
             assertAgree(nc.local, ns.remote)
             nc.close(); ns.close()
         }
+    }
+
+    /** A [KeyLog] that keeps what it is given. */
+    private class Recorder : KeyLog {
+        val lines = ArrayList<Triple<String, ByteArray, ByteArray>>()
+        override fun log(label: String, clientRandom: ByteArray, secret: ByteArray) {
+            lines += Triple(label, clientRandom, secret)
+        }
+    }
+
+    @Test
+    fun keyLogGetsTheSameSecretsOnBothSides() {
+        val cl = Recorder()
+        val sl = Recorder()
+        val client = own(TlsClientConfig(TestTls.ca.trustAnchors, keyLog = cl))
+        val server = own(TlsServerConfig(TestTls.server.certificates, TestTls.server.privateKey, keyLog = sl))
+        handshake(client, server)
+        val labels = setOf(
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0", "SERVER_TRAFFIC_SECRET_0", "EXPORTER_SECRET",
+        )
+        assertEquals(labels, cl.lines.map { it.first }.toSet())
+        assertEquals(labels, sl.lines.map { it.first }.toSet())
+        // One session: one client random, 32 bytes, the same on both sides; and the same secrets
+        val random = cl.lines.first().second
+        assertEquals(32, random.size)
+        for ((label, r, secret) in cl.lines) {
+            assertContentEquals(random, r)
+            val other = assertNotNull(sl.lines.firstOrNull { it.first == label })
+            assertContentEquals(random, other.second)
+            assertContentEquals(secret, other.third, label)
+        }
+    }
+
+    @Test
+    fun noKeyLogByDefaultAndAThrowingLogDoesNotFailTheHandshake() {
+        val throwing = object : KeyLog {
+            var calls = 0
+            override fun log(label: String, clientRandom: ByteArray, secret: ByteArray) {
+                calls++
+                error("log failed")
+            }
+        }
+        val (c, s) = handshake(own(TlsClientConfig(TestTls.ca.trustAnchors, keyLog = throwing)), own(TestTls.serverCrypto()))
+        assertFalse(c.session.isHandshaking)
+        assertFalse(s.session.isHandshaking)
+        assertEquals(5, throwing.calls)
+    }
+
+    @Test
+    fun keyLogFileWritesNssLines() {
+        val dir = platform.posix.getenv("TMPDIR")?.toKString()
+            ?: platform.posix.getenv("TEMP")?.toKString() ?: "/tmp"
+        val path = "$dir/neton-quic-keylog-${kotlin.random.Random.nextLong().toULong()}.txt"
+        assertFalse(KeyLogFile(null).isOpen)
+        val file = KeyLogFile(path)
+        assertTrue(file.isOpen)
+        val cl = Recorder()
+        val both = object : KeyLog {
+            override fun log(label: String, clientRandom: ByteArray, secret: ByteArray) {
+                cl.log(label, clientRandom, secret)
+                file.log(label, clientRandom, secret)
+            }
+        }
+        handshake(own(TlsClientConfig(TestTls.ca.trustAnchors, keyLog = both)), own(TestTls.serverCrypto()))
+        val text = readText(path)
+        platform.posix.remove(path)
+        val hex = { b: ByteArray -> b.joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') } }
+        val expected = cl.lines.joinToString("") { "${it.first} ${hex(it.second)} ${hex(it.third)}\n" }
+        assertEquals(expected, text)
+        // And the parsing of OpenSSL's lines drops malformed ones
+        val r = Recorder()
+        logKeyLine(r, "CLIENT_RANDOM 0a0B zz")
+        logKeyLine(r, "ONLY_TWO 0a")
+        logKeyLine(r, "LABEL 0a0B ff")
+        assertEquals(1, r.lines.size)
+        assertContentEquals(byteArrayOf(0x0a, 0x0b), r.lines[0].second)
+    }
+
+    private fun readText(path: String): String {
+        val f = assertNotNull(platform.posix.fopen(path, "rb"))
+        val out = StringBuilder()
+        memScoped {
+            val buf = allocArray<kotlinx.cinterop.ByteVar>(4096)
+            while (true) {
+                val n = platform.posix.fread(buf, 1u, 4096u, f).toInt()
+                if (n <= 0) break
+                out.append(buf.readBytes(n).decodeToString())
+            }
+        }
+        platform.posix.fclose(f)
+        return out.toString()
     }
 
     @Test

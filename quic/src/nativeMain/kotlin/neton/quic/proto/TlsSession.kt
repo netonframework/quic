@@ -5,6 +5,7 @@ package neton.quic.proto
 import kotlin.experimental.ExperimentalNativeApi
 import kotlin.native.ref.createCleaner
 import kotlinx.cinterop.COpaquePointer
+import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.CPointerVar
 import kotlinx.cinterop.ExperimentalForeignApi
@@ -184,6 +185,9 @@ internal class TlsCore(val side: Side, val serverAlpn: List<ByteArray>?) {
 
     /** A callback to fail on purpose (C-boundary tests). */
     var injectFailure: TlsCallback? = null
+
+    /** The configuration's key log, if any. */
+    var keyLog: KeyLog? = null
 
     // ---- incoming CRYPTO bytes ----
     private val incoming = ArrayDeque<ByteArray>()
@@ -643,6 +647,7 @@ class TlsSession private constructor(
         fun client(config: TlsClientConfig, version: Int, serverName: String, params: TransportParameters): TlsSession {
             val v = try { TlsQuicVersion.of(version) } catch (e: UnsupportedVersion) { throw ConnectError.UnsupportedVersion() }
             val session = TlsSession(Side.Client, version, v, config.alpn.isNotEmpty(), null)
+            session.core.keyLog = config.keyLog
             config.ctx.use { ctx -> session.open(ctx, params) }
             try {
                 val s = session.ssl!!
@@ -669,6 +674,7 @@ class TlsSession private constructor(
         fun server(config: TlsServerConfig, version: Int, params: TransportParameters): TlsSession {
             val v = TlsQuicVersion.of(version)
             val session = TlsSession(Side.Server, version, v, false, config.alpn)
+            session.core.keyLog = config.keyLog
             config.ctx.use { ctx -> session.open(ctx, params) }
             try {
                 SSL_set_accept_state(session.ssl!!)
@@ -920,6 +926,19 @@ internal val CLIENT_HELLO = staticCFunction { ssl: CPointer<SSL>?, al: CPointer<
         r == 1 && ok == 1 -> 1
         r == 1 -> { al?.pointed?.value = ALERT_NO_APPLICATION_PROTOCOL; 0 }
         else -> { al?.pointed?.value = ALERT_INTERNAL_ERROR; 0 }
+    }
+}
+
+/**
+ * A secret to log (SSL_CTX_set_keylog_callback, installed only when the configuration has a [KeyLog]). Like the ticket
+ * callback it never fails the connection: whatever the log throws is dropped.
+ */
+internal val KEY_LOG = staticCFunction { ssl: CPointer<SSL>?, line: CPointer<ByteVar>? ->
+    try {
+        val core = SSL_get_ex_data(ssl, 0)?.asStableRef<TlsCore>()?.get()
+        val log = core?.keyLog
+        if (log != null && !core.released && line != null) logKeyLine(log, line.toKString())
+    } catch (t: Throwable) {
     }
 }
 
