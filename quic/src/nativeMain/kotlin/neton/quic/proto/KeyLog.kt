@@ -32,7 +32,7 @@ interface KeyLog {
  */
 class KeyLogFile(path: String? = getenv("SSLKEYLOGFILE")?.toKString()?.ifEmpty { null }) : KeyLog {
     private val lock = SpinLock()
-    private val file: CPointer<FILE>? = path?.let { fopen(it, "a") }
+    private val file: CPointer<FILE>? = path?.let { fopen(it, "ab") } // binary: no CRLF on Windows
 
     /** Whether lines are written (a path was given and the file opened). */
     val isOpen: Boolean get() = file != null
