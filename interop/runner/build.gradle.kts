@@ -9,6 +9,6 @@ kotlin {
         }
     }
     sourceSets {
-        nativeMain.dependencies { implementation("com.netonstream:quic:0.1.0") }
+        nativeMain.dependencies { implementation("com.netonstream:quic:0.2.0") }
     }
 }

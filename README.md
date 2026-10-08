@@ -1,8 +1,10 @@
 # quic
 
 QUIC (RFC 9000 / 9001 / 9002) for Kotlin/Native on top of `com.netonstream:io`. The first version replicates quinn
-0.11.12 (quinn-proto). Release coordinate `com.netonstream:quic:0.1.0` (test double: `com.netonstream:quic-testkit:0.1.0`), built
-against `com.netonstream:io:0.3.0` and `com.netonstream:openssl:4.0.2`; package `neton.quic`.
+0.11.12 (quinn-proto). Release coordinate `com.netonstream:quic:0.2.0` (test double: `com.netonstream:quic-testkit:0.2.0`), built
+against `com.netonstream:io:0.3.2` and `com.netonstream:openssl:4.0.2`; package `neton.quic`. 0.2.0 adds session
+resumption and 0-RTT on real TLS, a key log, `Certificates.system()`, `RecvStream.isEarlyData()`, and the fixes found
+with the QUIC Interop Runner (SPEC §11.14–§11.19).
 
 Specification and implementation record: [SPEC.md](SPEC.md).
 
