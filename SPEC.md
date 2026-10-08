@@ -985,3 +985,26 @@ RFC 9001 §5.7 允许保留这类包。⚖️ 本库保留：
   - 镜像基于 `martenseemann/quic-network-simulator-endpoint`，CI（`.github/workflows/interop-runner.yml`）在 GitHub Actions 上构建镜像，按 runner
     固定版本与本库自身、quinn、quic-go、ngtcp2 双向运行全部用例；本库与本库之间支持的用例任一失败则 CI 失败，其余组合的结果写入作业摘要。
 
+### 11.17 握手在报文损坏下的三个缺陷（2026-10-08，QUIC Interop Runner 的 handshakecorruption）
+interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshakecorruption 失败：第 3 个连接服务端握手超时，客户端此后不再回应。为在本地复现，
+测试链路（`LinkImpairment`）新增"损坏"：按概率改动数据报前 64 字节中的一个字节（与网络模拟器的 corrupt-rate 相同）。`LossyPairTest.handshakesUnderCorruption`
+在真实 TLS 上以 30% 双向损坏连续建立连接，扫描 1000 个连接找出三个问题：
+- **PTO 只探测计时器所在的空间造成死锁** ⚖️：服务端承载 ServerHello 开头的 Initial 包被判丢失、数据等待重发，而重发受拥塞窗口限制；同时
+  Handshake 空间的 PTO 探测包对方因没有 Handshake 密钥无法确认，也不会被判丢失，占满窗口；Initial 空间没有在途的包，此后每次 PTO 都选
+  Handshake 空间，Initial 数据再也发不出去，直到空闲超时。客户端完成握手后有同样的情形：丢失的 Finished 等窗口，服务端暂不能解密的 1-RTT
+  包占满窗口，PTO 总选 Data 空间。RFC 9002 §6.2.4："除计时器所在空间外，发送方应（SHOULD）在其他有在途数据的空间也发送触发确认的包"；
+  quinn 只探测计时器所在的空间。修正：直到握手确认（Initial / Handshake 密钥丢弃）为止，PTO 时其他握手空间凡有在途包或待重发的 CRYPTO 数据，
+  也各发一个探测包。确定性测试 `lostServerHelloIsResentWhileHandshakeProbesFillTheWindow`（服务端的 Initial 丢 10 s、Handshake 照常到达）：
+  修正后 Initial 恢复到达 5.0 s 后握手完成，不修正为 11.0 s。客户端一侧的情形只在扫描中出现（服务端 TimedOut、客户端已完成），构造确定性
+  场景未能复现（Finished 不被判丢失时 Handshake 空间仍会被选中），由扫描覆盖。
+- **客户端发来的"Retry"使服务端关闭连接** ⚖️：Retry 无法认证，长头的类型位也不受头部保护，客户端 Initial 的首字节改动一位即读作 Retry；
+  quinn 此时以 PROTOCOL_VIOLATION 关闭连接，一个损坏或伪造的包即可终止握手。改为丢弃（RFC 9000 §5.2、§12.2：无法处理的包丢弃）。
+- **Version Negotiation 包不核对连接 ID** ⚖️：VN 的 Source Connection ID 应回显客户端的 Destination Connection ID（RFC 9000 §17.2.1）；不符的不是对
+  本次 Initial 的回应，改为忽略（quinn 不核对）。这也挡住服务端 Initial 的版本 0x00000001 末字节被改为 0 而读作 VN 的情形。quinn 的
+  `versionNegotiateClient` 手写的 VN 回显 00000000，测试中把客户端初始 DCID 固定为该值；新增不符时忽略的测试。
+- **仍保留的结果**（RFC 规定的行为，测试中计数并重连）：客户端 Initial 的版本被改动、服务端回 VN、VN 又被改得不再列出版本 1 时，按 RFC 9000
+  §6.2 放弃本次连接（VN 无法认证）；某一方需要的数据报在连续几次 PTO 中都被损坏、退避超过 30 s 空闲时限时空闲超时（RFC 9002）。测试的传输
+  阶段与 `handshakeUnderRandomLoss` 一样改为 5% 损坏（30% 下 1-RTT 阶段也会因同样的退避超时）。
+- **结果**：修正前，第一个种子的前 25 个连接中即有一个死锁；修正后两轮 1000 个连接的扫描最多一次空闲超时（退避所致）与少量 VN 放弃。提交的
+  测试为 200 个连接，允许上述两种结果合计至多 3 次。macOS 全量两种 TLS 模式各 617 个通过（3 个跳过）。
+

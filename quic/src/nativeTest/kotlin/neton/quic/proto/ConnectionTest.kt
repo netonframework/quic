@@ -119,7 +119,10 @@ class ConnectionTest {
         val serverAddr = SocketAddress.of(ByteArray(16).also { it[15] = 2 }, 7890)
         // Configure client to use empty CIDs so we can easily hardcode a server version negotiation packet
         val client = Endpoint(EndpointConfig.default().cidGenerator { RandomConnectionIdGenerator(0) }, null, true)
-        val (_, clientConn) = client.connect(TEST_EPOCH, clientConfig(), serverAddr, "localhost")
+        // ⚖️ The packet below echoes 00000000 as the client's Destination Connection ID, which this library checks
+        // (SPEC §11.17): the client starts with that ID
+        val config = clientConfig().initialDstCidProvider { ConnectionId.of(ByteArray(4)) }
+        val (_, clientConn) = client.connect(TEST_EPOCH, config, serverAddr, "localhost")
         val now = TEST_EPOCH
         val buf = Buffer(client.config().getMaxUdpPayloadSize().toInt())
         val event = client.handle(
@@ -133,6 +136,20 @@ class ConnectionTest {
         )
         if (event is DatagramEvent.ConnectionEvent) clientConn.handleEvent(event.event)
         assertEquals(Event.ConnectionLost(ConnectionError.VersionMismatch), clientConn.poll())
+    }
+
+    /** A Version Negotiation packet whose Source Connection ID is not the client's Destination Connection ID is ignored. */
+    @Test
+    fun versionNegotiateClientIgnoresOtherConnectionIds() {
+        val serverAddr = SocketAddress.of(ByteArray(16).also { it[15] = 2 }, 7890)
+        val client = Endpoint(EndpointConfig.default().cidGenerator { RandomConnectionIdGenerator(0) }, null, true)
+        val config = clientConfig().initialDstCidProvider { ConnectionId.of(byteArrayOf(1, 2, 3, 4)) }
+        val (_, clientConn) = client.connect(TEST_EPOCH, config, serverAddr, "localhost")
+        val buf = Buffer(client.config().getMaxUdpPayloadSize().toInt())
+        val event = client.handle(TEST_EPOCH, serverAddr, null, null, hex("80 00000000 00 04 00000000 0a1a2a3a"), buf)
+        if (event is DatagramEvent.ConnectionEvent) clientConn.handleEvent(event.event)
+        assertNull(clientConn.poll())
+        assertTrue(clientConn.isHandshaking)
     }
 
     private fun checkLifecycle(pair: ConnPair, clientCh: ConnectionHandle, serverCh: ConnectionHandle) {

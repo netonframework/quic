@@ -293,6 +293,90 @@ class LossyPairTest {
         println("handshake at 30% loss: mean ${total / 50} virtual")
     }
 
+    /**
+     * The server's Initial packets are lost for 10 s while its Handshake packets get through: the client has no
+     * Handshake keys (the ServerHello is in the lost Initials) and cannot acknowledge the Handshake probes, which fill
+     * the congestion window, while every PTO picks the Handshake space (SPEC §11.17). With a probe in the Initial space
+     * too, the handshake completes 5.0 s after the Initials get through again (the backoff reached by then); probing
+     * only the timer's space, as quinn does, 11.0 s.
+     */
+    @Test
+    fun lostServerHelloIsResentWhileHandshakeProbesFillTheWindow() = keysChecked {
+        val pair = ConnPair.real()
+        pair.latency = 15.milliseconds
+        val until = TEST_EPOCH + 10.seconds
+        pair.serverToClient = LinkImpairment(1).also { it.drop = { data, _ -> isInitial(data) && pair.time < until } }
+        val (clientCh, serverCh) = connectLossy(pair, realClientConfig(), limit = 40.seconds)
+        assertTrue(pair.time - until < 8.seconds, "handshake done ${pair.time - until} after the Initials got through")
+        closeAndDrain(pair, App(pair, clientCh, true))
+        assertNotNull(serverCh)
+    }
+
+    /**
+     * The interop runner's handshakecorruption: 30% of datagrams both ways get a byte changed in their first 64 bytes;
+     * one client endpoint makes connection after connection, on real TLS (whose ClientHello and ServerHello span two
+     * datagrams each). Two outcomes are allowed besides success, each followed by a new connection as an application
+     * would: a Version Negotiation packet (unauthenticated) changed so that it no longer lists version 1, which RFC 9000
+     * §6.2 makes the client abandon; and, rarely, an idle timeout when the datagram a side needs is changed on several
+     * PTOs in a row, so that the backoff outgrows the 30 s idle timeout (RFC 9002). Before SPEC §11.17 handshakes
+     * deadlocked until the idle timeout (server or client side); sweeps of 1000 connections afterwards had at most one
+     * timeout, from backoff.
+     */
+    @Test
+    fun handshakesUnderCorruption() = keysChecked {
+        var versionMismatches = 0
+        var timeouts = 0
+        for (seed in 0 until 8) {
+            val pair = ConnPair.real()
+            pair.latency = 15.milliseconds
+            pair.clientToServer = LinkImpairment(seed * 2L + 100).also { it.corrupt = 0.3 }
+            pair.serverToClient = LinkImpairment(seed * 2L + 101).also { it.corrupt = 0.3 }
+            var n = 0
+            while (n < 25) {
+                try {
+                    val clientCh = pair.beginConnect(realClientConfig())
+                    var serverCh: ConnectionHandle? = null
+                    val done = pair.driveUntil(2.minutes) {
+                        if (serverCh == null) serverCh = pair.server.connections.keys.firstOrNull()
+                        val s = serverCh
+                        val c = pair.clientConn(clientCh)
+                        c.isClosed || (!c.isHandshaking && s != null && !pair.serverConn(s).isHandshaking)
+                    }
+                    assertTrue(done, "handshake did not complete at ${pair.time - TEST_EPOCH}")
+                    val events = pair.clientConn(clientCh).drainEvents()
+                    val s = serverCh
+                    val serverEvents = s?.let { pair.serverConn(it).drainEvents() } ?: emptyList()
+                    val lost = (events + serverEvents).filterIsInstance<Event.ConnectionLost>().map { it.reason }
+                    if (ConnectionError.VersionMismatch in lost || ConnectionError.TimedOut in lost) {
+                        if (ConnectionError.VersionMismatch in lost) versionMismatches++ else timeouts++
+                        val drained = pair.driveUntil(2.minutes) {
+                            pair.client.endpoint.openConnections() == 0 && pair.server.endpoint.openConnections() == 0
+                        }
+                        assertTrue(drained, "connections did not drain after $lost")
+                        continue
+                    }
+                    assertTrue(Event.Connected in events, "client: $events")
+                    assertTrue(Event.Connected in serverEvents, "server: $serverEvents")
+                    val client = App(pair, clientCh, true)
+                    val server = App(pair, checkNotNull(s), false)
+                    // Then a usable link for the transfer, as in handshakeUnderRandomLoss: at 30% both ways the PTO
+                    // backoff (with an RTT estimate inflated during the handshake) can outgrow the idle timeout
+                    pair.clientToServer!!.corrupt = 0.05
+                    pair.serverToClient!!.corrupt = 0.05
+                    transfer(pair, client, server, Random(n).nextBytes(2_000), 2.minutes)
+                    closeAndDrain(pair, client)
+                    pair.clientToServer!!.corrupt = 0.3
+                    pair.serverToClient!!.corrupt = 0.3
+                    n++
+                } catch (e: AssertionError) {
+                    throw AssertionError("seed $seed connection $n: ${e.message}", e)
+                }
+            }
+        }
+        println("corruption: 200 connections; $versionMismatches abandoned on a changed Version Negotiation packet, $timeouts idle timeouts")
+        assertTrue(versionMismatches + timeouts <= 3, "$versionMismatches version mismatches, $timeouts timeouts in 200 connections")
+    }
+
     // ---- final ACKs ----
 
     @Test

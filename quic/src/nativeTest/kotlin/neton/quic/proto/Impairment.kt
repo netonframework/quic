@@ -18,6 +18,12 @@ internal class LinkImpairment(seed: Long) {
     /** Probability that a datagram is lost. */
     var loss = 0.0
 
+    /**
+     * Probability that a delivered datagram has one byte changed, at a random offset among its first 64 bytes (headers
+     * and the start of the payload), as the QUIC network simulator's corrupt-rate scenario does.
+     */
+    var corrupt = 0.0
+
     /** Probability that a delivered datagram is delivered twice. */
     var duplicate = 0.0
 
@@ -61,6 +67,10 @@ internal class LinkImpairment(seed: Long) {
     var duplicated = 0L
         private set
 
+    /** Datagrams delivered with a changed byte. */
+    var corrupted = 0L
+        private set
+
     /** Datagrams held back. */
     var reordered = 0L
         private set
@@ -88,6 +98,11 @@ internal class LinkImpairment(seed: Long) {
             dropped++
             return emptyList()
         }
+        if (corrupt > 0 && data.isNotEmpty() && rng.nextDouble() < corrupt) {
+            corrupted++
+            val at = rng.nextInt(minOf(data.size, 64))
+            data[at] = (data[at].toInt() xor (1 + rng.nextInt(255))).toByte()
+        }
         val first = if (reorder > 0 && rng.nextDouble() < reorder) {
             reordered++
             heldBack()
@@ -105,7 +120,7 @@ internal class LinkImpairment(seed: Long) {
         (1 + rng.nextLong(maxOf(1L, reorderDelay.inWholeMicroseconds))).microseconds
 
     override fun toString(): String =
-        "datagrams=$datagrams dropped=$dropped (by rule $droppedByRule) duplicated=$duplicated reordered=$reordered"
+        "datagrams=$datagrams dropped=$dropped (by rule $droppedByRule) corrupted=$corrupted duplicated=$duplicated reordered=$reordered"
 
     companion object {
         /** A direction with random [loss], and optionally duplication and reordering. */

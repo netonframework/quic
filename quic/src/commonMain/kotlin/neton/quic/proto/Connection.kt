@@ -1152,6 +1152,21 @@ class Connection internal constructor(
             2
         }
         spaces[space].lossProbes = saturatingAddU32(spaces[space].lossProbes, count)
+        // ⚖️ RFC 9002 §6.2.4: besides the space whose timer expired, the sender SHOULD send ack-eliciting packets in
+        // the other spaces with in-flight data. quinn probes only the timer's space. During the handshake that can
+        // deadlock: lost Initial CRYPTO data waits for congestion window that the Handshake probes fill (the peer,
+        // still without Handshake keys, never acknowledges them), and with nothing of the Initial space in flight
+        // every PTO picks the Handshake space again, until the idle timeout (the interop runner's handshakecorruption).
+        // The client has the same trap after completing its handshake: its lost Finished waits while 1-RTT packets the
+        // server cannot decrypt yet fill the window, and the PTO picks the Data space. So, until the handshake is
+        // confirmed (the Initial and Handshake keys are gone), a probe also goes to each other handshake space that has
+        // data in flight or waiting to be resent.
+        for (other in HANDSHAKE_SPACE_IDS) {
+            if (other == space || spaces[other].crypto == null) continue
+            if (spaces[other].hasInFlight() || spaces[other].pending.crypto.isNotEmpty()) {
+                spaces[other].lossProbes = saturatingAddU32(spaces[other].lossProbes, 1)
+            }
+        }
         ptoCount = saturatingAddU32(ptoCount, 1)
         setLossDetectionTimer(now)
     }
@@ -1809,7 +1824,11 @@ class Connection internal constructor(
         when (val header = packet.header) {
             is Header.Retry -> {
                 val remCid = header.srcCid
-                if (side.isServer) throw TransportError.PROTOCOL_VIOLATION("client sent Retry")
+                // ⚖️ quinn closes the connection with PROTOCOL_VIOLATION ("client sent Retry"). A Retry carries nothing
+                // the server can authenticate, and the packet type bits are not header-protected: a client Initial with
+                // one byte changed in transit reads as a Retry (the interop runner's handshakecorruption), as can a
+                // packet forged off-path. Discard it, as packets that cannot be processed are (RFC 9000 §12.2, §5.2).
+                if (side.isServer) return null
 
                 if (totalAuthedPackets > 1 ||
                     packet.payloadLen <= 16 || // token + 16 byte tag
@@ -1933,6 +1952,11 @@ class Connection internal constructor(
             }
             is Header.VersionNegotiate -> {
                 if (totalAuthedPackets > 1) return null
+                // ⚖️ A Version Negotiation packet echoes the client's Destination Connection ID as its Source Connection
+                // ID (RFC 9000 §17.2.1); one that does not is not an answer to our Initial. This keeps a server Initial
+                // whose version 0x00000001 had its last byte zeroed in transit from reading as a Version Negotiation
+                // packet that abandons the connection (quinn does not check).
+                if (header.srcCid != initialDstCid) return null
                 var supported = false
                 var at = packet.payloadStart
                 val end = packet.payloadStart + packet.payloadLen
@@ -2965,6 +2989,9 @@ private const val MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE = 1 + 4 + 1 + MAX_CID_SIZE +
  */
 private const val MIN_PACKET_SPACE = MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE + 32
 
+
+/** The packet number spaces of the handshake. */
+private val HANDSHAKE_SPACE_IDS = arrayOf(SpaceId.Initial, SpaceId.Handshake)
 
 /** The most packets kept for keys still to come (quic-go keeps 32 per connection). */
 private const val MAX_UNDECRYPTABLE = 16
