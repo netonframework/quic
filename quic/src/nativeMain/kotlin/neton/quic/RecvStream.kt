@@ -233,6 +233,13 @@ class RecvStream internal constructor(
     fun is0rtt(): Boolean = is0rtt
 
     /**
+     * ⚖️ Whether this stream's data may be a 0-RTT replay: [is0rtt] (opened by this side, or accepted, while handshaking),
+     * or opened by the peer in a 0-RTT packet. A server that awaits the handshake before accepting streams sees the
+     * client's 0-RTT requests here and not through [is0rtt] (quinn has only the latter).
+     */
+    fun isEarlyData(): Boolean = is0rtt || conn.inner.peerStreamOpenedIn0rtt(id)
+
+    /**
      * Completes when the stream has been reset by the peer or otherwise closed (recv_stream.rs:271). Yields the reset
      * error code if the stream was reset, `null` if it was otherwise closed (finished, or stopped by us). Throws
      * [ResetError].

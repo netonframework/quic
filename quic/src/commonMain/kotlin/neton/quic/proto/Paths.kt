@@ -229,15 +229,16 @@ internal class PathResponses {
     private val remotes = arrayOfNulls<SocketAddress>(MAX_PATH_RESPONSES)
     private var len = 0
 
+    /**
+     * ⚖️ Queue a response to every PATH_CHALLENGE (RFC 9000 §8.2.2: an endpoint MUST respond by echoing the data of the
+     * PATH_CHALLENGE). quinn keeps one per remote and replaces it with a newer challenge, so a peer that sends two in a
+     * row (ngtcp2 after a NAT rebinding; the interop runner's rebind-port / rebind-addr) never gets the first answered.
+     * A repeated token is queued once.
+     */
     fun push(packet: Long, token: Long, remote: SocketAddress) {
         for (i in 0 until len) {
-            if (remotes[i] == remote) {
-                // Update a queued response
-                if (packets[i] <= packet) {
-                    packets[i] = packet
-                    tokens[i] = token
-                    remotes[i] = remote
-                }
+            if (remotes[i] == remote && tokens[i] == token) {
+                if (packets[i] < packet) packets[i] = packet
                 return
             }
         }

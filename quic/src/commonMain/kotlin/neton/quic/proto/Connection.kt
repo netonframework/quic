@@ -175,6 +175,9 @@ class Connection internal constructor(
     /** Number of packets received which could not be authenticated. */
     private var authenticationFailures = 0L
 
+    /** The highest index of a peer stream that carried data in a 0-RTT packet, per direction (bidi, uni); -1 for none. */
+    private val earlyPeerStreams = longArrayOf(-1L, -1L)
+
     /**
      * ⚖️ Handshake and 1-RTT packets that arrived during the handshake before their keys, kept (at most
      * [MAX_UNDECRYPTABLE]) and processed once the keys are there (RFC 9001 §5.7 allows this; quinn drops them, with a
@@ -1646,6 +1649,21 @@ class Connection internal constructor(
         handlePacket(now, remote, ecn, packet, statelessReset)
     }
 
+    private fun noteEarlyPeerStream(id: StreamId) {
+        if (id.initiator == side.side) return
+        val d = id.dir.ordinal
+        if (id.index > earlyPeerStreams[d]) earlyPeerStreams[d] = id.index
+    }
+
+    /**
+     * ⚖️ Whether the peer opened stream [id] in 0-RTT: data for it, or for a later stream of the same direction (which
+     * opens it too, RFC 9000 §3.2), came in a 0-RTT packet, so what the stream carries may be a replay (RFC 9001
+     * §9.2). quinn tells this only by whether the application accepted the stream while the connection was still
+     * handshaking (`RecvStream::is_0rtt`), which a server that awaits the handshake first never sees.
+     */
+    fun peerStreamOpenedIn0rtt(id: StreamId): Boolean =
+        id.initiator != side.side && id.index <= earlyPeerStreams[id.dir.ordinal]
+
     /** Keep a Handshake or 1-RTT packet that came before its keys, while the handshake may still bring them. */
     private fun keepUndecryptable(remote: SocketAddress, ecn: EcnCodepoint?, partialDecode: PartialDecode) {
         if (!state.isHandshake || partialDecode.space == SpaceId.Initial) return
@@ -2043,8 +2061,9 @@ class Connection internal constructor(
             }
             when (frame) {
                 is Frame.Crypto -> readCrypto(SpaceId.Data, frame, payloadLen)
-                is Frame.Stream -> if (streams.received(frame, payloadLen).shouldTransmit) {
-                    spaces[SpaceId.Data].pending.maxData = true
+                is Frame.Stream -> {
+                    if (is0rtt) noteEarlyPeerStream(frame.id)
+                    if (streams.received(frame, payloadLen).shouldTransmit) spaces[SpaceId.Data].pending.maxData = true
                 }
                 is Frame.Ack -> onAckReceived(now, SpaceId.Data, frame)
                 Frame.Padding, Frame.Ping -> {}
@@ -2337,16 +2356,14 @@ class Connection internal constructor(
             }
         }
 
-        // PATH_RESPONSE
-        if (buf.len + 9 < maxSize && spaceId == SpaceId.Data) {
-            val token = pathResponses.popOnPath(path.remote)
-            if (token != null) {
-                sent.nonRetransmits = true
-                sent.requiresPadding = true
-                FrameType.PATH_RESPONSE.encode(buf)
-                buf.writeLong(token)
-                stats.frameTx.pathResponse += 1
-            }
+        // PATH_RESPONSE: every queued on-path response that fits (one per challenge, see PathResponses.push)
+        while (buf.len + 9 < maxSize && spaceId == SpaceId.Data) {
+            val token = pathResponses.popOnPath(path.remote) ?: break
+            sent.nonRetransmits = true
+            sent.requiresPadding = true
+            FrameType.PATH_RESPONSE.encode(buf)
+            buf.writeLong(token)
+            stats.frameTx.pathResponse += 1
         }
 
         // CRYPTO

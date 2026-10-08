@@ -1008,3 +1008,28 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
 - **结果**：修正前，第一个种子的前 25 个连接中即有一个死锁；修正后两轮 1000 个连接的扫描最多一次空闲超时（退避所致）与少量 VN 放弃。提交的
   测试为 200 个连接，允许上述两种结果合计至多 3 次。macOS 全量两种 TLS 模式各 617 个通过（3 个跳过）。
 
+### 11.18 interop-runner 结果、PATH_RESPONSE 与早期数据标记（2026-10-08）
+- **interop-runner 结果**（GitHub Actions，runner 740c05a；本库支持 19 个用例，http3 / v2 / connectionmigration 以 127 退出）：
+  | 服务端 / 客户端 | 首轮（1b21f59） | §11.16 zerortt 调整后（75df8d4） | §11.17 修正后（261c780） |
+  |---|---|---|---|
+  | neton / neton | 17 / 19（zerortt、handshakecorruption） | 19 / 19 | 19 / 19 |
+  | neton / quinn | 19 / 19 | 19 / 19 | 18 / 19（handshakeloss） |
+  | quinn / neton | 18 / 19（zerortt） | 17 / 19（handshakeloss、handshakecorruption） | 19 / 19 |
+  | neton / quic-go | 16 / 18（handshakeloss、handshakecorruption） | 18 / 18 | 18 / 18 |
+  | quic-go / neton | 17 / 18（zerortt） | 18 / 18 | 17 / 18（handshakecorruption） |
+  | neton / ngtcp2 | 19 / 19 | 19 / 19 | 19 / 19 |
+  | ngtcp2 / neton | 16 / 20（zerortt、rebind-port、rebind-addr、connectionmigration） | 17 / 20（rebind ×2、connectionmigration） | 19 / 20（connectionmigration） |
+  - zerortt 的失败（客户端 1-RTT 数据过多）由 §11.16 的客户端调整解决，此后各组合均通过。
+  - 握手丢包 / 损坏类用例在不同轮次时过时不过：§11.17 修正了其中的死锁；最新一轮仍各有一次失败（neton 服务端 / quinn 客户端的 handshakeloss，
+    quic-go 服务端 / neton 客户端的 handshakecorruption），原因待查。
+  - ngtcp2 服务端 / neton 客户端的 connectionmigration：客户端以 127 退出，runner 仍记为失败（与 quinn、quic-go 服务端时记为不支持不同），待查。
+- **每个 PATH_CHALLENGE 都回应** ⚖️：ngtcp2 服务端 / neton 客户端的 rebind 两轮失败，runner 报告"PATH_CHALLENGE 没有 PATH_RESPONSE"。本库照 quinn
+  每个远端只排队一个回应、新挑战替换旧的，连续两个挑战时前一个得不到回应；RFC 9000 §8.2.2 要求逐个回显。改为每个挑战排队一个回应（同一令牌
+  只排一次），在途路径的回应在一个包内尽量都写入。最新一轮（未含此修正）rebind 已通过，失败时过时不过，此修正是按 RFC 的修正，与失败的因果
+  未经证实。单元测试 `PathsTest.pathResponses` 改为断言两个挑战都得到回应。
+- **早期数据标记** ⚖️：`RecvStream.isEarlyData()`——`is0rtt()`（quinn：本端在握手期间打开或接受了该流），或对端在 0-RTT 包中打开了该流（该流或
+  同方向更大序号的流在 0-RTT 包中带有数据，RFC 9000 §3.2 的隐式打开）。等握手完成后才接受流的服务端用 `is0rtt()` 永远看不到客户端的 0-RTT
+  请求，而这些数据可被重放（RFC 9001 §9.2）。HTTP/3 的 `RequestStream.isEarlyData()` 由此而来（http3 SPEC §4）。测试
+  `RealTlsDriverTest.earlyDataIsVisibleToAServerThatAwaitsTheHandshake`：等握手完成再接受流，0-RTT 的流 `is0rtt` 为假、`isEarlyData` 为真，
+  握手后打开的流两者皆假。macOS 全量两种 TLS 模式各 619 个通过。
+

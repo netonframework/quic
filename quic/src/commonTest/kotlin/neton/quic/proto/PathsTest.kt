@@ -136,14 +136,18 @@ class PathsTest {
         val b = SocketAddress.ipv4(10, 0, 0, 2, 1)
         val r = PathResponses()
         assertTrue(r.isEmpty())
+        // ⚖️ Every challenge is answered (quinn kept only the newest per remote): two in a row from one remote, and a
+        // repeated token queued once
         r.push(5, 100, a)
-        r.push(4, 101, a) // older challenge for a queued remote: ignored
-        r.push(6, 102, a) // newer: replaces
-        r.push(7, 200, b)
+        r.push(6, 102, a)
+        r.push(7, 102, a)
+        r.push(8, 200, b)
         assertNull(r.popOnPath(a)) // the last one is for b
         assertEquals(OffPathResponse(200, b), r.popOffPath(a))
         assertNull(r.popOffPath(a))
         assertEquals(102L, r.popOnPath(a))
+        assertEquals(100L, r.popOnPath(a))
+        assertNull(r.popOnPath(a))
         assertTrue(r.isEmpty())
 
         // At most 16 queued responses

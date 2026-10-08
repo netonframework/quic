@@ -166,6 +166,56 @@ class RealTlsDriverTest {
         server.shutdown()
     }
 
+    /**
+     * A server that awaits the handshake before accepting streams still learns which ones the client opened in 0-RTT
+     * (`isEarlyData`, SPEC §11.18); quinn's `is0rtt` says only whether the stream was accepted while handshaking.
+     * A stream the client opens after the handshake is not early data.
+     */
+    @Test
+    fun earlyDataIsVisibleToAServerThatAwaitsTheHandshake() = quicTest {
+        val server = server()
+        val crypto = TestTls.clientCrypto(h3)
+        val client = client(ClientConfig(crypto))
+        val seen = ArrayList<Pair<Boolean, Boolean>>() // (is0rtt, isEarlyData) per accepted stream
+        val serverTask = launch {
+            repeat(2) { round ->
+                val incoming = assertNotNull(server.accept())
+                // Accepted later, so that the client's 0-RTT stream is sent before the handshake can complete
+                delay(100)
+                val conn = incoming.await()
+                launch {
+                    repeat(if (round == 0) 1 else 2) {
+                        val (send, recv) = conn.acceptBi()
+                        seen += recv.is0rtt() to recv.isEarlyData()
+                        send.writeAll(recv.readToEnd())
+                        send.finish()
+                    }
+                    conn.closed()
+                }
+            }
+        }
+        suspend fun echo(conn: Connection, text: String) {
+            val (send, recv) = conn.openBi()
+            send.writeAll(text.encodeToByteArray())
+            send.finish()
+            assertContentEquals(text.encodeToByteArray(), recv.readToEnd())
+        }
+        val first = client.connect(server.localAddr(), "localhost").await()
+        echo(first, "1-RTT")
+        while (crypto.tickets.size == 0) delay(5)
+        first.close(VarInt(0), ByteArray(0))
+        val (conn, accepted) = assertNotNull(client.connect(server.localAddr(), "localhost").into0Rtt())
+        echo(conn, "0-RTT")
+        assertTrue(accepted.await())
+        echo(conn, "after the handshake")
+        conn.close(VarInt(0), ByteArray(0))
+        serverTask.join()
+        assertEquals(listOf(false to false, false to true, false to false), seen)
+        client.waitIdle()
+        client.close()
+        server.shutdown()
+    }
+
     @Test
     fun connectByIpAddress() = quicTest {
         val server = server()
