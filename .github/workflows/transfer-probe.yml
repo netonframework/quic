@@ -1,0 +1,56 @@
+name: Transfer probe
+
+# A measurement, not a check: TransferProbeTest (4 MiB on one endpoint, 5 rounds) on each driver, built against io's
+# main branch, with the Windows UDP receive batch at 1 (quinn-udp's) and 32 (io SPEC §29.9). Runs when the probe or this
+# workflow changes.
+on:
+  push:
+    paths:
+      - quic/src/nativeTest/kotlin/neton/quic/TransferProbeTest.kt
+      - .github/workflows/transfer-probe.yml
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: transfer probe (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS kqueue, os: macos-14, task: macosArm64Test, driver: "", batch: "" }
+          - { name: Linux epoll, os: ubuntu-latest, task: linuxX64Test, driver: epoll, batch: "" }
+          - { name: Windows IOCP batch 1, os: windows-latest, task: mingwX64Test, driver: "", batch: "1" }
+          - { name: Windows IOCP batch 32, os: windows-latest, task: mingwX64Test, driver: "", batch: "32" }
+          - { name: Windows WSAPoll batch 1, os: windows-latest, task: mingwX64Test, driver: wsapoll, batch: "1" }
+          - { name: Windows WSAPoll batch 32, os: windows-latest, task: mingwX64Test, driver: wsapoll, batch: "32" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      NETON_IO_DRIVER: ${{ matrix.driver }}
+      NETON_IO_UDP_BATCH: ${{ matrix.batch }}
+      NETON_QUIC_TRANSFER_PROBE: "5"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: netonframework/io
+          ref: main
+          path: io-src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
+      - name: Probe
+        shell: bash
+        run: ./gradlew --include-build io-src :quic:${{ matrix.task }} --tests 'neton.quic.TransferProbeTest' --no-daemon --stacktrace
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          { echo "### transfer probe (${{ matrix.name }})"; echo '```'; grep -ho 'transfer probe: [^<&]*' quic/build/test-results/*/*TransferProbe*.xml; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
