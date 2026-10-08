@@ -21,7 +21,7 @@
   - 只支持 QUIC v1 与 draft 29–34（`DEFAULT_SUPPORTED_VERSIONS`）；无 QUIC v2（RFC 9369），无多路径。
   - 流与连接的流量控制窗口固定，没有自动调节；只有"何时发送窗口更新"的阈值会随窗口变化。
   - 客户端不迁移到服务端的首选地址，只保存该地址的连接 ID。
-  - 握手期间到达的短头包直接丢弃，不缓存（代码中有 TODO）。
+  - 握手期间到达的短头包直接丢弃，不缓存（代码中有 TODO）。本库改为保留尚无密钥的握手包与 1-RTT 包，见 §11.15 ⚖️。
 - **不在本库**：
   - TLS 1.3 协议本身：由 OpenSSL 4.0.2（经 `com.netonstream:openssl` 的原始绑定）完成；本库实现 QUIC 所需的 TLS 会话层（§4、§11.9）。
   - UDP 系统调用层：由 neton-io 数据报层提供（§9）。
@@ -953,4 +953,35 @@ rustls——在 OpenSSL 4.0.2 的第三方 QUIC TLS 接口上实现（`TlsSessio
   `LossyDriverTest.handshakeUnderRandomLoss` 与 Windows WSAPoll 的 `ManyConnectionsTest` 各一次超时（均在替身 TLS 上，与本节改动的代码无关；
   前者是空闲超时：30% 双向丢包下多数据报的握手数据组常被连续丢失，PTO 逐次翻倍，连续六七次即超过默认 30 s 的空闲时限；本机每个种子 2–3 s、
   连续 10 次通过。该测试验证的是丢包下完成握手而非空闲时限，改为 120 s 空闲时限并注明原因。后者未复现，记为待观察）。
+
+### 11.15 握手期间先于密钥到达的包（2026-10-08）
+quinn 丢弃握手期间无法解密的包（`handle_decode` 中没有该空间的密钥即丢弃；已解密的短头包在 Handshake 状态下也丢弃，附 TODO"SHOULD buffer"）。
+RFC 9001 §5.7 允许保留这类包。⚖️ 本库保留：
+- **范围**：握手期间（`State.Handshake`）到达、所属空间（Handshake 或 1-RTT）尚无密钥的包，每个连接至多 16 个（quic-go 为 32）。Initial 包
+  不保留（其密钥一开始就有）；握手结束后到达的不保留。端点已经拥有数据报的字节（驱动对每个数据报复制一次），所以保留的是包本身，不再复制。
+- **处理时机**：每个数据报处理完后，按到达顺序处理已有密钥的保留包；处理过程中又带来新密钥时继续；握手结束后仍无密钥的丢弃。
+- **未覆盖**：已解密的 1-RTT 包在 Handshake 状态下仍照 quinn 丢弃。这种情况只出现在服务端先于客户端 Finished 拿到 1-RTT 密钥时（rustls、测试
+  替身）；OpenSSL 的服务端在收到客户端 Finished 时才给出 1-RTT 读密钥，并同时完成握手，所以真实 TLS 下走的是上面的保留路径。
+- **测量**（`UndecryptablePacketsTest`，真实 TLS，单向时延 10 ms）：
+  - 服务端首个数据报（Initial 与 Handshake 的开头）被后面的数据报超过 30 ms：客户端握手完成用时 42.5 ms，丢弃时为 70 ms（等服务端重发）。
+  - 客户端的 Finished 丢失，随后的 1-RTT 数据先到：服务端保留后处理，客户端判定丢失的包为 0、流帧 6 个；丢弃时客户端判定 7 个包丢失、
+    流帧 12 个（数据发了两遍）。
+  - 关闭保留（上限设为 0）时三个测试都失败。quinn 的 `handshake1rttHandling` 断言该数据丢失，在真实 TLS 下改为断言未丢失、保留的包被处理，
+    测试替身下保持 quinn 的断言。
+- macOS 全量两种 TLS 模式各 614 个通过（3 个跳过）。
+
+### 11.16 密钥日志与 QUIC Interop Runner（2026-10-08）
+- **密钥日志**（rustls `KeyLog` / `KeyLogFile`）：`TlsClientConfig` 与 `TlsServerConfig` 新增 `keyLog: KeyLog?`（默认 `null`，不记录）。设置时
+  经 `SSL_CTX_set_keylog_callback` 收到 OpenSSL 的 NSS 格式行，拆成标签、ClientHello 随机数与密钥交给 `KeyLog.log`；`KeyLogFile` 按
+  `SSLKEYLOGFILE`（或给定路径）追加写入，Wireshark 可直接读取；没有路径或打不开时不记录（同 rustls）。回调与票据回调一样不会使连接失败。
+  测试（`TlsSessionTest`）：两端记录相同的五个密钥（握手、1-RTT、导出）及同一个 32 字节随机数；抛异常的日志不影响握手；文件内容逐行核对。
+- **QUIC Interop Runner 端点**（`interop/runner`，独立的 Gradle 构建，不进入发布）：
+  - HTTP/0.9（ALPN `hq-interop`）客户端与服务端，按 runner 的约定读取 `ROLE`、`TESTCASE`、`REQUESTS`、`SSLKEYLOGFILE`，服务端在 443 端口提供
+    `/www`，客户端写入 `/downloads`；不支持的用例以 127 退出。
+  - 支持：handshake、transfer（含 multiplexing、longrtt、blackhole、amplificationlimit、transferloss、transfercorruption、ipv6、rebind-port、
+    rebind-addr 等以 transfer 运行的用例）、chacha20、retry、resumption、zerortt、multiconnect（handshakeloss、handshakecorruption）、keyupdate
+    （客户端）、ecn。
+  - 不支持：http3（在 http3 仓库）、v2（本库无 QUIC v2，§0）、connectionmigration（客户端不迁移到首选地址，§0）。
+  - 镜像基于 `martenseemann/quic-network-simulator-endpoint`，CI（`.github/workflows/interop-runner.yml`）在 GitHub Actions 上构建镜像，按 runner
+    固定版本与本库自身、quinn、quic-go、ngtcp2 双向运行全部用例；本库与本库之间支持的用例任一失败则 CI 失败，其余组合的结果写入作业摘要。
 

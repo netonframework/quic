@@ -175,6 +175,21 @@ class Connection internal constructor(
     /** Number of packets received which could not be authenticated. */
     private var authenticationFailures = 0L
 
+    /**
+     * ⚖️ Handshake and 1-RTT packets that arrived during the handshake before their keys, kept (at most
+     * [MAX_UNDECRYPTABLE]) and processed once the keys are there (RFC 9001 §5.7 allows this; quinn drops them, with a
+     * TODO to buffer). Without this, a server flight whose first datagram is overtaken by the next ones, or client
+     * 1-RTT data sent right behind a lost Finished, waits for a retransmission (one PTO) instead of being used on
+     * arrival. The endpoint gave up ownership of the datagram bytes, so the packets are kept without a copy.
+     */
+    private val undecryptable = ArrayDeque<Undecryptable>()
+
+    /** Packets kept in [undecryptable], and how many of them were processed later (for tests). */
+    internal var undecryptableKept = 0L
+        private set
+    internal var undecryptableReplayed = 0L
+        private set
+
     /** Why the connection was lost, if it has been. */
     private var error: ConnectionError? = null
 
@@ -768,6 +783,7 @@ class Connection internal constructor(
                     stats.udpRx.bytes += (firstDecode.restEnd - firstDecode.restStart).toLong()
                     handleCoalesced(now, remote, ecn, firstDecode.data, firstDecode.restStart, firstDecode.restEnd)
                 }
+                replayUndecryptable(now)
 
                 if (wasAntiAmplificationBlocked) {
                     // A prior attempt to set the loss detection timer may have failed due to anti-amplification, so
@@ -1589,8 +1605,11 @@ class Connection internal constructor(
         } else {
             val space = partialDecode.space
             if (space != null) {
-                // discarding unexpected packets of a space without keys
-                spaces[space].crypto?.header?.remote ?: return
+                // keeping (during the handshake) or discarding packets of a space without keys
+                spaces[space].crypto?.header?.remote ?: run {
+                    keepUndecryptable(remote, ecn, partialDecode)
+                    return
+                }
             } else {
                 // Unprotected packet
                 null
@@ -1610,6 +1629,36 @@ class Connection internal constructor(
             null
         }
         handlePacket(now, remote, ecn, packet, statelessReset)
+    }
+
+    /** Keep a Handshake or 1-RTT packet that came before its keys, while the handshake may still bring them. */
+    private fun keepUndecryptable(remote: SocketAddress, ecn: EcnCodepoint?, partialDecode: PartialDecode) {
+        if (!state.isHandshake || partialDecode.space == SpaceId.Initial) return
+        if (undecryptable.size >= MAX_UNDECRYPTABLE) return
+        undecryptable.addLast(Undecryptable(remote, ecn, partialDecode))
+        undecryptableKept++
+    }
+
+    /**
+     * Process the kept packets whose keys have arrived, in arrival order; drop the rest once the handshake is over
+     * (their keys will not come). Repeats while a processed packet brings further keys.
+     */
+    private fun replayUndecryptable(now: Instant) {
+        var progress = true
+        while (progress && undecryptable.isNotEmpty()) {
+            progress = false
+            repeat(undecryptable.size) {
+                val p = undecryptable.removeFirst()
+                when {
+                    spaces[p.decode.space!!].crypto != null -> {
+                        undecryptableReplayed++
+                        handleDecode(now, p.remote, p.ecn, p.decode)
+                        progress = true
+                    }
+                    state.isHandshake -> undecryptable.addLast(p)
+                }
+            }
+        }
     }
 
     /** mod.rs:2278 */
@@ -2916,6 +2965,12 @@ private const val MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE = 1 + 4 + 1 + MAX_CID_SIZE +
  */
 private const val MIN_PACKET_SPACE = MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE + 32
 
+
+/** The most packets kept for keys still to come (quic-go keeps 32 per connection). */
+private const val MAX_UNDECRYPTABLE = 16
+
+/** A packet kept for its keys: where it came from and the packet itself. */
+private class Undecryptable(val remote: SocketAddress, val ecn: EcnCodepoint?, val decode: PartialDecode)
 
 /** Perform key updates this many packets before the AEAD confidentiality limit. */
 private const val KEY_UPDATE_MARGIN = 10_000L

@@ -729,7 +729,15 @@ class ConnectionTest {
 
         pair.drive()
 
-        assertTrue(pair.clientConn(clientCh).stats().path.lostPackets != 0L)
+        if (TestTls.kind == TestTlsKind.Real) {
+            // ⚖️ OpenSSL gives the server its 1-RTT keys only with the client's Finished: the early 1-RTT packet is
+            // kept until then and processed (SPEC §11.15), nothing is lost.
+            assertEquals(0L, pair.clientConn(clientCh).stats().path.lostPackets)
+            assertEquals(1L, pair.serverConn(serverCh).undecryptableReplayed)
+        } else {
+            // The test double gives them before; a decrypted 1-RTT packet in the Handshake state is dropped (quinn).
+            assertTrue(pair.clientConn(clientCh).stats().path.lostPackets != 0L)
+        }
         val chunks = pair.serverRecv(serverCh, s).read(false)
         assertChunk(chunks.next(Int.MAX_VALUE), 0, msg)
         chunks.finalize()

@@ -33,6 +33,12 @@ internal class LinkImpairment(seed: Long) {
      */
     var drop: ((data: ByteArray, index: Long) -> Boolean)? = null
 
+    /**
+     * Targeted reordering, consulted after [drop]: returns how long to hold a datagram back (later ones overtake it),
+     * or null for the other rules to decide.
+     */
+    var hold: ((data: ByteArray, index: Long) -> Duration?)? = null
+
     /** Sees every datagram and its fate (for tracing a scenario). */
     var observer: ((data: ByteArray, index: Long, fate: Fate) -> Unit)? = null
 
@@ -73,6 +79,10 @@ internal class LinkImpairment(seed: Long) {
             dropped++
             droppedByRule++
             return emptyList()
+        }
+        hold?.invoke(data, index)?.let {
+            reordered++
+            return listOf(it)
         }
         if (loss > 0 && rng.nextDouble() < loss) {
             dropped++
