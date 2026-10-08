@@ -34,7 +34,6 @@ import neton.openssl.c.SSL_CTX
 import neton.openssl.c.SSL_CTX_free
 import neton.openssl.c.SSL_CTX_get_cert_store
 import neton.openssl.c.SSL_CTX_new
-import neton.openssl.c.SSL_CTX_ctrl
 import neton.openssl.c.SSL_CTX_sess_set_new_cb
 import neton.openssl.c.SSL_CTX_set_alpn_select_cb
 import neton.openssl.c.SSL_CTX_set_ciphersuites
@@ -217,7 +216,7 @@ class TlsClientConfig private constructor(
             }
             if (clientCertificate != null) useIdentity(ctx, clientCertificate, clientKey!!)
             // Tickets reach the session through the new-session callback; OpenSSL keeps no client cache of its own.
-            SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, (SSL_SESS_CACHE_CLIENT or SSL_SESS_CACHE_NO_INTERNAL_STORE).toLong(), null)
+            sslCtxSetSessionCacheMode(ctx, SSL_SESS_CACHE_CLIENT or SSL_SESS_CACHE_NO_INTERNAL_STORE)
             SSL_CTX_sess_set_new_cb(ctx, NEW_SESSION)
         })
     }
@@ -354,6 +353,9 @@ internal const val TLSEXT_NAMETYPE_HOST_NAME = 0
 /** `SSL_set_tlsext_host_name` (a macro over `SSL_ctrl`, whose C `long` differs between targets). */
 internal expect fun sslSetTlsextHostName(ssl: CPointer<SSL>, name: String): Boolean
 
+/** SSL_CTX_set_session_cache_mode, per platform: SSL_CTX_ctrl takes a C `long` (32-bit on Windows). */
+internal expect fun sslCtxSetSessionCacheMode(ctx: CPointer<SSL_CTX>, mode: Int)
+
 /** OpenSSL's names of the cipher suites. */
 internal val CipherSuite.openSslName: String
     get() = when (this) {
@@ -371,7 +373,7 @@ internal fun cipherSuiteOf(protocolId: Int): CipherSuite? = when (protocolId) {
 }
 
 private const val SSL_OP_NO_COMPRESSION = 0x20000uL // SSL_OP_BIT(17)
-private const val SSL_CTRL_SET_SESS_CACHE_MODE = 44
+internal const val SSL_CTRL_SET_SESS_CACHE_MODE = 44
 private const val SSL_SESS_CACHE_CLIENT = 0x0001
 private const val SSL_SESS_CACHE_NO_INTERNAL_STORE = 0x0300 // NO_INTERNAL_LOOKUP | NO_INTERNAL_STORE
 
