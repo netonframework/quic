@@ -35,6 +35,7 @@ import neton.quic.proto.PrivateKey
 import neton.quic.proto.ServerConfig
 import neton.quic.proto.TlsClientConfig
 import neton.quic.proto.TlsServerConfig
+import neton.quic.proto.TransportConfig
 import neton.quic.proto.VarInt
 import neton.quic.proto.default
 import neton.quic.proto.withCrypto
@@ -213,10 +214,16 @@ private fun runClient(testcase: String, requestList: String) {
             cipherSuites = cipherSuites(testcase),
             enableEarlyData = testcase == "zerortt",
             keyLog = KeyLogFile(),
+            // zerortt allows the client little 1-RTT data: a one-datagram ClientHello leaves more of the initial
+            // congestion window for the 0-RTT requests (OpenSSL's default ML-KEM hybrid share takes two datagrams)
+            groups = if (testcase == "zerortt") "X25519" else null,
         )
         val local = if (server.family == 6) SocketAddress.IPV6_UNSPECIFIED_ANY_PORT else SocketAddress.IPV4_UNSPECIFIED_ANY_PORT
         val endpoint = Endpoint.create(EndpointConfig.default(), null, bindUdp(local))
-        endpoint.setDefaultClientConfig(ClientConfig(tls))
+        val client = ClientConfig(tls)
+        // ...and no path MTU probes, which are padded 1-RTT packets of up to 1452 bytes
+        if (testcase == "zerortt") client.transportConfig(TransportConfig().mtuDiscoveryConfig(null))
+        endpoint.setDefaultClientConfig(client)
         when (testcase) {
             "multiconnect" -> for (r in requests) {
                 val conn = endpoint.connect(server, r.host).await()
@@ -300,6 +307,7 @@ private suspend fun fetch(conn: Connection, r: Request) {
 private suspend fun closeAndWait(conn: Connection) {
     conn.close(VarInt(0), ByteArray(0))
     conn.closed()
+    log("connection stats: ${conn.stats()}")
 }
 
 // ---- helpers ----
