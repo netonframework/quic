@@ -2,7 +2,7 @@
 
 > Kotlin/Native 的 QUIC（RFC 9000 / 9001 / 9002，另含 RFC 9221 数据报、DPLPMTUD、ACK Frequency 草案）协议库，建在 `com.netonstream:io` 之上。
 > 坐标 `com.netonstream:quic`，包 `neton.quic`。仓库 `quic`。
-> 状态：v1 已实现（0-RTT 除外），实现与验收记录见 §11；首个发布版本 0.1.0（2026-10-07，依赖 io 0.2.0、openssl 4.0.2；不含 Windows 目标，见 §11.12）。
+> 状态：v1 已实现（含会话恢复与 0-RTT，§11.14），实现与验收记录见 §11；首个发布版本 0.1.0（2026-10-08，依赖 io 0.3.0、openssl 4.0.2；含 Windows，见 §11.13）。
 
 ## 0. 依据与范围
 

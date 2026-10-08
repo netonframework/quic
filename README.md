@@ -8,9 +8,9 @@ Specification and implementation record: [SPEC.md](SPEC.md).
 
 ## Status
 
-Real TLS works and quinn interop passes in both directions (SPEC §11.9), so the QUIC protocol and its TLS layer are
-complete for this version **except 0-RTT**, which is a separate later batch. Tested on macOS arm64 and Linux x64
-(epoll and io_uring).
+Real TLS works and quinn interop passes in both directions (SPEC §11.9), including session resumption and 0-RTT
+(SPEC §11.14), so the QUIC protocol and its TLS layer are complete for this version. Tested in CI on macOS (kqueue),
+Linux x64 (epoll, io_uring) and Windows (IOCP, WSAPoll).
 
 What exists (SPEC §11.1–11.10):
 - varint and frame codecs, and packet protection and header protection on openssl-kotlin primitives;
@@ -28,7 +28,10 @@ What exists (SPEC §11.1–11.10):
   with receive and send budgets, the lifecycle rules as explicit `close()`, streams as neton-io `IoStream`;
 - quinn's connection, token and driver tests (the TLS-dependent ones on real TLS; the rest run on either the real
   session or the test double, `NETON_QUIC_TEST_TLS=real`); the whole suite passes on both (SPEC §11.11), the 0-RTT
-  tests skip on real TLS with the reason printed, and real TLS is checked to decline 0-RTT cleanly;
+  tests included (SPEC §11.14);
+- session tickets and 0-RTT on the real TLS session: clients keep tickets per server name (single use) and send 0-RTT
+  when a ticket allows it (`TlsClientConfig(enableEarlyData = true)`, the default); servers accept 0-RTT
+  (`TlsServerConfig(earlyData = true)`, the default) with OpenSSL's replay protection (single-use tickets);
 - verification under an impaired network (SPEC §11.10): seeded loss, reordering, duplication and delay in the
   protocol-level simulation and through a UDP relay for the real driver — bulk transfer at 1/5/20% loss, lost handshake
   flights, key updates, resets and stops, closes under loss, exhausted flow-control credit, chaos soaks; two bugs found
@@ -36,11 +39,10 @@ What exists (SPEC §11.1–11.10):
   before the handshake completed could not open streams when the ClientHello spanned two datagrams (also in quinn
   0.11.12, SPEC §11.11); 606 tests, run on macOS arm64 and on Linux x64 with both drivers (SPEC §11.12).
 - two-way interop with quinn 0.11 (`interop/quinn-peer`): handshake with certificate verification and ALPN,
-  bidirectional stream echo, key updates initiated by each side, application close, and the rejection cases.
+  bidirectional stream echo, key updates initiated by each side, 0-RTT with each side's tickets, application close,
+  and the rejection cases; run in CI on Linux with both drivers.
 
 What is missing:
-- **0-RTT** (session tickets, early data keys, early data acceptance) — a separate later batch; tickets and early data
-  are off.
 - The server sends no 0.5-RTT data: OpenSSL yields the server's 1-RTT read secret only after the client's Finished.
 - Tests have run on macOS arm64 and Linux x64 only; the other targets are compile-checked.
 - `FairnessTest` has latency bounds that a heavily loaded host can exceed (seen at a load average above 100 on the
