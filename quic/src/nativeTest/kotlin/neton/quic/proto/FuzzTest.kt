@@ -10,8 +10,8 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Deterministic robustness tests for the decoders, after quinn's `fuzz/fuzz_targets` (packet, params, streamid; the
- * `streams` target needs the stream state machine, not ported yet, so frames take its place). Instead of libFuzzer,
+ * Deterministic robustness tests for the decoders and the stream state machine, after quinn's `fuzz/fuzz_targets`
+ * (packet, params, streamid, streams), plus frames. Instead of libFuzzer,
  * each target runs a fixed number of seeded inputs: random bytes, and valid encodings mutated byte-wise (flips,
  * overwrites with boundary values, insertions, deletions, truncation, duplication). Every decoder may only fail with
  * its declared error types, and whatever decodes must survive decode -> encode -> decode unchanged.
@@ -99,7 +99,68 @@ class FuzzTest {
         }
     }
 
-    // ---- frames (in place of fuzz_targets/streams.rs) ----
+    // ---- fuzz_targets/streams.rs ----
+
+    /**
+     * Random stream limits and windows (u16, as quinn's `StreamParams`), then random operations on a server's
+     * [StreamsState]: open, accept, finish, reset, and a peer's STOP_SENDING and RESET_STREAM (quinn's operations), plus
+     * the peer's MAX_STREAMS, MAX_DATA and STREAM frames and writes, on stream IDs mostly
+     * near the ones in use and sometimes anywhere. quinn only requires no panic; here the operations may only fail
+     * with their declared errors, and an opened stream's index stays below the limit.
+     */
+    @Test
+    fun streams() {
+        val rng = Random(0x57e4)
+        var opened = 0
+        repeat(ITERATIONS / 10) {
+            val dir = if (rng.nextBoolean()) Dir.Bi else Dir.Uni
+            // A frame on a remote stream opens every lower one (as in quinn), so limits are mostly small: a full u16
+            // range in every round costs a minute for nothing more.
+            fun limit() = (if (rng.nextInt(16) == 0) rng.nextInt(0, 65536) else rng.nextInt(0, 64)).toLong()
+            val maxRemoteUni = limit()
+            val maxRemoteBi = limit()
+            val state = StreamsState(Side.Server, VarInt(maxRemoteUni), VarInt(maxRemoteBi), rng.nextInt(0, 65536).toLong(),
+                VarInt(rng.nextInt(0, 65536).toLong()), VarInt(rng.nextInt(0, 65536).toLong()))
+            val pending = Retransmits()
+            val connClosed = rng.nextInt(16) == 0
+            fun id(): StreamId = if (rng.nextInt(8) == 0) StreamId(rng.nextLong(0, VarInt.MAX.value))
+                else StreamId.of(if (rng.nextBoolean()) Side.Server else Side.Client, if (rng.nextBoolean()) Dir.Bi else Dir.Uni, rng.nextLong(0, 8))
+            fun code() = VarInt(rng.nextLong(0, VarInt.MAX.value))
+            repeat(rng.nextInt(0, 64)) {
+                when (rng.nextInt(10)) {
+                    0 -> Streams(state, connClosed).open(dir)?.let { s ->
+                        opened++
+                        assertEquals(Side.Server, s.initiator)
+                        assertTrue(s.index < state.max[dir.ordinal], "opened $s past the limit ${state.max[dir.ordinal]}")
+                    }
+                    1 -> Streams(state, connClosed).accept(if (rng.nextBoolean()) Dir.Bi else Dir.Uni)?.let { s ->
+                        assertEquals(Side.Client, s.initiator)
+                    }
+                    2 -> expecting<FinishError, Unit>("finish") { SendStream(id(), state, pending, connClosed).finish() }
+                    3 -> Streams(state, connClosed).state.receivedStopSending(id(), code())
+                    4 -> expecting<TransportError, ShouldTransmit>("receivedReset") {
+                        Streams(state, connClosed).state.receivedReset(Frame.ResetStream(id(), code(), VarInt(rng.nextLong(0, VarInt.MAX.value))))
+                    }
+                    5 -> expecting<ClosedStream, Unit>("reset") { SendStream(id(), state, pending, connClosed).reset(VarInt(0)) }
+                    // Beyond quinn's target: the peer's MAX_STREAMS, MAX_DATA and STREAM frames, and writes, so that
+                    // streams actually open, get accepted and carry data.
+                    6 -> expecting<TransportError, Unit>("receivedMaxStreams") {
+                        state.receivedMaxStreams(dir, if (rng.nextInt(16) == 0) rng.nextLong(0, Long.MAX_VALUE) else rng.nextLong(0, 16))
+                    }
+                    7 -> state.receivedMaxData(VarInt(rng.nextLong(0, 1L shl 20)))
+                    8 -> expecting<TransportError, ShouldTransmit>("received") {
+                        val data = Bytes.wrap(randomBytes(rng, rng.nextInt(0, 200)))
+                        val offset = if (rng.nextInt(8) == 0) rng.nextLong(0, VarInt.MAX.value) else rng.nextLong(0, 1000)
+                        state.received(Frame.Stream(id(), offset, rng.nextBoolean(), data), data.size)
+                    }
+                    else -> SendStream(id(), state, pending, connClosed).write(randomBytes(rng, rng.nextInt(0, 2000)))
+                }
+            }
+        }
+        assertTrue(opened > 0, "no stream was ever opened")
+    }
+
+    // ---- frames ----
 
     @Test
     fun frames() {
