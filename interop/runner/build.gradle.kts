@@ -1,4 +1,4 @@
-plugins { kotlin("multiplatform") version "2.4.0" }
+plugins { kotlin("multiplatform") version "2.4.20" }
 
 // linuxX64 goes into the Docker image; macosArm64 is for trying the endpoint locally.
 kotlin {
