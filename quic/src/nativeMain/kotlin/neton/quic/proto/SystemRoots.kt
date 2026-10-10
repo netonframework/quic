@@ -8,9 +8,7 @@ import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.readBytes
 import kotlinx.cinterop.toKString
-import neton.openssl.c.ERR_clear_error
-import neton.openssl.c.PEM_read_bio_X509
-import neton.openssl.c.X509_free
+import neton.openssl.QuicTlsCredentials
 import platform.posix.fclose
 import platform.posix.fopen
 import platform.posix.fread
@@ -39,27 +37,11 @@ internal fun systemRootsDer(): List<ByteArray> {
     return found.filter { seen.add(it.contentHashCode().toString() + ":" + it.size) && parsesAsCertificate(it) }
 }
 
-private fun parsesAsCertificate(der: ByteArray): Boolean = try {
-    X509_free(parseDer(der))
-    true
-} catch (e: Exception) {
-    ERR_clear_error()
-    false
-}
+private fun parsesAsCertificate(der: ByteArray): Boolean = QuicTlsCredentials.isCertificate(der)
 
 /** Every CERTIFICATE block of a PEM document; anything else (text, other blocks) is skipped. */
-internal fun pemCertificates(pem: ByteArray): List<ByteArray> {
-    val out = ArrayList<ByteArray>()
-    if (pem.isEmpty()) return out
-    withMemBio(pem) { bio ->
-        while (true) {
-            val x = PEM_read_bio_X509(bio, null, null, null) ?: break
-            try { out += toDer(x) } finally { X509_free(x) }
-        }
-    }
-    ERR_clear_error() // the "no start line" that ends the loop
-    return out
-}
+internal fun pemCertificates(pem: ByteArray): List<ByteArray> =
+    if (pem.isEmpty()) emptyList() else QuicTlsCredentials.pemCertificates(pem)
 
 /** The certificates of every PEM file in [dir] (no recursion); an unreadable directory gives none. */
 internal fun pemDirectory(dir: String): List<ByteArray> =

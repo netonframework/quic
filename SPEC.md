@@ -1114,3 +1114,16 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
   X25519MLKEM768）回 HelloRetryRequest，之后客户端 14 个数据报丢 7 个、三次 PTO 探测连续丢失，服务端 30 s 空闲时限先到，62.8 s 带
   完整第二个 ClientHello 的探测到达时连接已丢弃。HRR 多一个往返源自 OpenSSL 的后量子偏好，是安全选择，不为测试更改。
 
+### 11.22 TLS 改走 openssl-kotlin 的 QUIC TLS 外观（2026-10-11，JVM 支持的前提）
+- openssl-kotlin（docs/QUIC_TLS.md）把 OpenSSL 第三方 QUIC TLS 接口的回调移到 C（`neton_quic_tls.h`），按连接排队，供 Kotlin 在每次
+  OpenSSL 调用后取走；Kotlin/Native 与 JVM（JNI）共用。本库 `TlsSession`、`TlsConfig` 与系统根证书的解析改写在 `QuicTlsContext` /
+  `QuicTls` 上：不再有 `staticCFunction`、StableRef 与原生缓冲区（`NativeTls.liveStableRefs` 恒为 0）；各平台的 `SslCtrl.*` 删除。
+  quinn 语义的部分（级别推进、密钥交接、握手数据、错误映射、票据与 0-RTT、ALPN 不一致时只恢复不发 0-RTT）不变。
+- 回调层的上限与检查由外观执行，行为与原 `TlsCore` 相同（64 KiB 入站、单个不超过 16384 字节的未释放记录、1 MiB 出站、密钥变更后
+  残留数据为 unexpected_message、失败只记第一个、票据回调失败只丢票据）。原 `recordStaysPinnedUntilReleasedAndQueuesAreBounded` 随
+  回调迁到 openssl-kotlin（`QuicTlsCallbacksTest`，直接调用 C 函数）。
+- 验证（macOS arm64，`--include-build ../openssl-kotlin`）：全量 624 个通过、3 个与 quinn 一致地跳过，测试替身与真实 TLS
+  （`NETON_QUIC_TEST_TLS=real`）两种模式各一遍。改写中发现：默认传输参数编码为 0 字节时外观拒绝创建连接，已在 openssl-kotlin 修正。
+- 依赖 openssl-kotlin 4.0.2-3（含外观，待发布）；本库 CI 的 Windows 作业无法从源码构建 OpenSSL，所以在其发布前此改动留在分支
+  `tls-facade`。
+

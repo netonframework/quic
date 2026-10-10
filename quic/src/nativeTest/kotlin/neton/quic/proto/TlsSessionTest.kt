@@ -534,37 +534,8 @@ class TlsSessionTest {
         assertFalse(s.session.isHandshaking)
     }
 
-    // ---- the record lifetime contract, on the callback core directly ----
-
-    @Test
-    fun recordStaysPinnedUntilReleasedAndQueuesAreBounded() = memScoped {
-        val core = TlsCore(Side.Server, null)
-        core.queueIncoming(ByteArray(MAX_RECORD + 10) { it.toByte() })
-        val buf = alloc<CPointerVar<kotlinx.cinterop.UByteVar>>()
-        val len = alloc<ULongVar>()
-        core.recvRecord(buf.ptr, len.ptr)
-        assertEquals(MAX_RECORD.toULong(), len.value)
-        val rec = buf.value!!
-        // more data arriving does not touch the outstanding record
-        core.queueIncoming(ByteArray(100) { 0x55 })
-        for (i in 0 until MAX_RECORD) assertEquals(i.toByte(), rec[i].toByte())
-        // only one record at a time
-        assertFailsWith<IllegalStateException> { core.recvRecord(buf.ptr, len.ptr) }
-        // partial release keeps it
-        core.releaseRecord(1000)
-        assertEquals(rec, core.record)
-        assertEquals(3.toByte(), rec[3].toByte())
-        core.releaseRecord(MAX_RECORD - 1000)
-        assertNull(core.record)
-        core.recvRecord(buf.ptr, len.ptr)
-        assertEquals(110uL, len.value)
-        assertFailsWith<IllegalStateException> { core.releaseRecord(111) }
-        core.releaseRecord(110)
-        core.recvRecord(buf.ptr, len.ptr)
-        assertEquals(0uL, len.value)
-        assertFailsWith<TransportError> { core.queueIncoming(ByteArray(MAX_INCOMING + 1)) }
-        core.wipe()
-    }
+    // The record lifetime contract (one outstanding record, unchanged until released, partial releases, the incoming
+    // bound) is the C layer's since the callbacks moved into openssl-kotlin; its tests are there (QuicTlsCallbacksTest).
 
     // ---- the C boundary ----
 
@@ -584,7 +555,7 @@ class TlsSessionTest {
                 c.injectCallbackFailure(cb)
                 exchange(cEnd, sEnd)
                 assertFalse(c.isHandshaking)
-                assertEquals(1, c.core.droppedTickets, "the ticket whose callback failed was dropped")
+                assertEquals(1, c.droppedTickets, "the ticket whose callback failed was dropped")
                 continue
             }
             if (cb == TlsCallback.ALERT) {

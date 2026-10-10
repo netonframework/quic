@@ -1,68 +1,17 @@
-@file:OptIn(ExperimentalForeignApi::class, ExperimentalNativeApi::class)
+@file:OptIn(ExperimentalNativeApi::class)
 
 package neton.quic.proto
 
-import kotlinx.cinterop.ByteVar
-import kotlinx.cinterop.COpaquePointer
-import kotlinx.cinterop.CPointer
-import kotlinx.cinterop.CPointerVar
-import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.UByteVar
-import kotlinx.cinterop.addressOf
-import kotlinx.cinterop.alloc
-import kotlinx.cinterop.convert
-import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.ptr
-import kotlinx.cinterop.readBytes
-import kotlinx.cinterop.reinterpret
-import kotlinx.cinterop.staticCFunction
-import kotlinx.cinterop.usePinned
-import kotlinx.cinterop.value
-import neton.openssl.c.BIO
-import neton.openssl.c.BIO_free
-import neton.openssl.c.BIO_new_mem_buf
-import neton.openssl.c.ERR_clear_error
-import neton.openssl.c.EVP_PKEY
-import neton.openssl.c.EVP_PKEY_free
-import neton.openssl.c.OPENSSL_sk_free
-import neton.openssl.c.OPENSSL_sk_new_null
-import neton.openssl.c.OPENSSL_sk_push
-import neton.openssl.c.PEM_read_bio_PrivateKey
-import neton.openssl.c.PEM_read_bio_X509
-import neton.openssl.c.SSL
-import neton.openssl.c.SSL_CTX
-import neton.openssl.c.SSL_CTX_free
-import neton.openssl.c.SSL_CTX_get_cert_store
-import neton.openssl.c.SSL_CTX_new
-import neton.openssl.c.SSL_CTX_sess_set_new_cb
-import neton.openssl.c.SSL_CTX_set_alpn_select_cb
-import neton.openssl.c.SSL_CTX_set_ciphersuites
-import neton.openssl.c.SSL_CTX_set_keylog_callback
-import neton.openssl.c.SSL_CTX_set_client_hello_cb
-import neton.openssl.c.SSL_CTX_set_options
-import neton.openssl.c.SSL_CTX_set_session_id_context
-import neton.openssl.c.SSL_CTX_set_verify
-import neton.openssl.c.SSL_CTX_use_cert_and_key
-import neton.openssl.c.SSL_VERIFY_FAIL_IF_NO_PEER_CERT
-import neton.openssl.c.SSL_VERIFY_NONE
-import neton.openssl.c.SSL_VERIFY_PEER
-import neton.openssl.c.TLS_method
-import neton.openssl.c.X509
-import neton.openssl.c.X509_STORE_add_cert
-import neton.openssl.c.X509_free
-import neton.openssl.c.d2i_AutoPrivateKey
-import neton.openssl.c.d2i_X509
-import neton.openssl.c.i2d_X509
-import neton.openssl.c.neton_openssl_tls13_only
-import neton.openssl.c.neton_tls_groups
+import neton.openssl.QuicTlsContext
+import neton.openssl.QuicTlsCredentials
 import kotlin.concurrent.AtomicInt
 import kotlin.experimental.ExperimentalNativeApi
 import kotlin.native.ref.createCleaner
 
 // The TLS 1.3 configurations of the real QUIC TLS layer (quinn-proto `crypto/rustls.rs` `QuicClientConfig` /
 // `QuicServerConfig`, with the certificate handling of quinn's `ClientConfig::with_root_certificates` and
-// `ServerConfig::with_single_cert`), on OpenSSL 4.0.2's third-party QUIC TLS interface through openssl-kotlin's raw
-// bindings (`neton.openssl.c`). The session state machine is in `TlsSession.kt`.
+// `ServerConfig::with_single_cert`), on OpenSSL 4.0.2's third-party QUIC TLS interface through openssl-kotlin's QUIC TLS
+// facade (`QuicTlsContext`, its callbacks in C). The session state machine is in `TlsSession.kt`.
 //
 // Ownership: a configuration owns one SSL_CTX reference and releases it in [TlsClientConfig.close] /
 // [TlsServerConfig.close] (a GC cleaner only backs this up). Every session holds its own reference to the SSL_CTX
@@ -87,7 +36,10 @@ class Certificates private constructor(internal val der: List<ByteArray>) {
         /** Certificates from their DER encodings; each is parsed to check it is a certificate. */
         fun der(certificates: List<ByteArray>): Certificates {
             require(certificates.isNotEmpty()) { "no certificates" }
-            for (c in certificates) parseDer(c).also { X509_free(it) }
+            for (c in certificates) {
+                require(c.isNotEmpty()) { "empty certificate" }
+                require(QuicTlsCredentials.isCertificate(c)) { "invalid DER certificate" }
+            }
             return Certificates(certificates.map { it.copyOf() })
         }
 
@@ -95,14 +47,8 @@ class Certificates private constructor(internal val der: List<ByteArray>) {
 
         /** Every `CERTIFICATE` block of a PEM document, in order. */
         fun pem(pem: ByteArray): Certificates {
-            val out = ArrayList<ByteArray>()
-            withMemBio(pem) { bio ->
-                while (true) {
-                    val x = PEM_read_bio_X509(bio, null, null, null) ?: break
-                    try { out += toDer(x) } finally { X509_free(x) }
-                }
-            }
-            ERR_clear_error() // the "no start line" that ends the loop
+            require(pem.isNotEmpty()) { "empty input" }
+            val out = QuicTlsCredentials.pemCertificates(pem)
             require(out.isNotEmpty()) { "no PEM certificate found" }
             return Certificates(out)
         }
@@ -128,33 +74,18 @@ class Certificates private constructor(internal val der: List<ByteArray>) {
 }
 
 /** A private key (PKCS#8, or a traditional RSA / EC key), as DER or PEM (unencrypted). */
-class PrivateKey private constructor(private val bytes: ByteArray, private val isPem: Boolean) {
-    /** Parse into a fresh EVP_PKEY owned by the caller. */
-    internal fun load(): CPointer<EVP_PKEY> {
-        ERR_clear_error()
-        val key = if (isPem) {
-            withMemBio(bytes) { bio -> PEM_read_bio_PrivateKey(bio, null, NO_PASSWORD, null) }
-        } else {
-            bytes.usePinned { pinned ->
-                memScoped {
-                    val p = alloc<CPointerVar<UByteVar>>()
-                    p.value = pinned.addressOf(0).reinterpret()
-                    d2i_AutoPrivateKey(null, p.ptr, bytes.size.convert())
-                }
-            }
-        }
-        return key ?: throw IllegalArgumentException("invalid private key: ${drainOpenSslErrors()}")
-    }
-
+class PrivateKey private constructor(internal val bytes: ByteArray, internal val isPem: Boolean) {
     companion object {
         fun der(der: ByteArray): PrivateKey {
             require(der.isNotEmpty()) { "empty private key" }
-            return PrivateKey(der.copyOf(), false).also { EVP_PKEY_free(it.load()) }
+            require(QuicTlsCredentials.isPrivateKey(der, pem = false)) { "invalid private key" }
+            return PrivateKey(der.copyOf(), false)
         }
 
         fun pem(pem: ByteArray): PrivateKey {
             require(pem.isNotEmpty()) { "empty private key" }
-            return PrivateKey(pem.copyOf(), true).also { EVP_PKEY_free(it.load()) }
+            require(QuicTlsCredentials.isPrivateKey(pem, pem = true)) { "invalid private key" }
+            return PrivateKey(pem.copyOf(), true)
         }
 
         fun pem(pem: String): PrivateKey = pem(pem.encodeToByteArray())
@@ -228,18 +159,15 @@ class TlsClientConfig private constructor(
 
     init {
         require((clientCertificate == null) == (clientKey == null)) { "a client certificate needs its private key" }
-        ctx = SslContextResource(newQuicContext(cipherSuites, groups) { ctx ->
-            if (trustAnchors != null) {
-                SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null)
-                addTrustAnchors(ctx, trustAnchors)
-            } else {
-                SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)
-            }
-            if (clientCertificate != null) useIdentity(ctx, clientCertificate, clientKey!!)
-            // Tickets reach the session through the new-session callback; OpenSSL keeps no client cache of its own.
-            sslCtxSetSessionCacheMode(ctx, SSL_SESS_CACHE_CLIENT or SSL_SESS_CACHE_NO_INTERNAL_STORE)
-            SSL_CTX_sess_set_new_cb(ctx, NEW_SESSION)
-            if (keyLog != null) SSL_CTX_set_keylog_callback(ctx, KEY_LOG)
+        // Tickets reach the session through the facade's new-session callback; OpenSSL keeps no client cache of its own.
+        ctx = SslContextResource(quicContext(cipherSuites, groups) { suites, g ->
+            QuicTlsContext(
+                server = false, cipherSuites = suites, groups = g,
+                verifyMode = if (trustAnchors != null) 1 else 0,
+                trustAnchorsDer = trustAnchors?.der.orEmpty(),
+                certificateChainDer = clientCertificate?.der, privateKey = clientKey?.bytes, privateKeyIsPem = clientKey?.isPem ?: false,
+                keyLog = keyLog != null,
+            )
         })
     }
 
@@ -295,29 +223,20 @@ class TlsServerConfig(
     internal val keyLog: KeyLog? = null,
 ) : CryptoServerConfig, AutoCloseable {
     internal val alpn: List<ByteArray> = validateAlpn(alpnProtocols)
-    internal val ctx: SslContextResource = SslContextResource(newQuicContext(cipherSuites, groups) { ctx ->
-        useIdentity(ctx, certificateChain, privateKey)
-        when (clientAuth) {
-            ClientAuth.None -> SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, null)
-            is ClientAuth.Request -> {
-                SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null)
-                addTrustAnchors(ctx, clientAuth.trustAnchors)
-            }
-            is ClientAuth.Require -> {
-                SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT, null)
-                addTrustAnchors(ctx, clientAuth.trustAnchors)
-            }
+    // ALPN selection and the "client offered no ALPN" check run in the facade's context callbacks with the protocols
+    // each session carries, so nothing points into this configuration (sessions outlive a closed configuration). The
+    // facade also sets the session ID context resumption needs once client certificates are verified.
+    internal val ctx: SslContextResource = SslContextResource(quicContext(cipherSuites, groups) { suites, g ->
+        val (mode, anchors) = when (clientAuth) {
+            ClientAuth.None -> 0 to emptyList()
+            is ClientAuth.Request -> 1 to clientAuth.trustAnchors.der
+            is ClientAuth.Require -> 2 to clientAuth.trustAnchors.der
         }
-        // ALPN selection and the "client offered no ALPN" check find the session through the SSL's app data, so that
-        // nothing here points into this configuration (sessions outlive a closed configuration).
-        SSL_CTX_set_alpn_select_cb(ctx, ALPN_SELECT, null)
-        SSL_CTX_set_client_hello_cb(ctx, CLIENT_HELLO, null)
-        if (keyLog != null) SSL_CTX_set_keylog_callback(ctx, KEY_LOG)
-        // Resumption needs a session ID context once client certificates are verified; one per configuration.
-        val sid = "neton-quic".encodeToByteArray()
-        check(sid.usePinned { SSL_CTX_set_session_id_context(ctx, it.addressOf(0).reinterpret(), sid.size.toUInt()) } == 1) {
-            "session id context: ${drainOpenSslErrors()}"
-        }
+        QuicTlsContext(
+            server = true, cipherSuites = suites, groups = g, verifyMode = mode, trustAnchorsDer = anchors,
+            certificateChainDer = certificateChain.der, privateKey = privateKey.bytes, privateKeyIsPem = privateKey.isPem,
+            keyLog = keyLog != null,
+        )
     })
 
     @Suppress("unused")
@@ -339,14 +258,14 @@ class TlsServerConfig(
  * The configuration's SSL_CTX reference. [use] lends it for SSL_new; [close] releases it once no [use] is running
  * (the last [use] to finish after [close] releases it), exactly once, whether by the owner or its cleaner.
  */
-internal class SslContextResource(private val ctx: CPointer<SSL_CTX>) {
+internal class SslContextResource(private val ctx: QuicTlsContext) {
     /** Number of running [use]s, or -1 once released. */
     private val users = AtomicInt(0)
     private val closed = AtomicInt(0)
 
     init { NativeTls.contextOpened() }
 
-    fun <T> use(block: (CPointer<SSL_CTX>) -> T): T {
+    fun <T> use(block: (QuicTlsContext) -> T): T {
         while (true) {
             val n = users.value
             check(n >= 0 && closed.value == 0) { "the TLS configuration is closed" }
@@ -366,21 +285,12 @@ internal class SslContextResource(private val ctx: CPointer<SSL_CTX>) {
 
     private fun free() {
         if (!users.compareAndSet(0, -1)) return
-        SSL_CTX_free(ctx)
+        ctx.close()
         NativeTls.contextFreed()
     }
 }
 
 // ---- helpers ----
-
-internal const val SSL_CTRL_SET_TLSEXT_HOSTNAME = 55
-internal const val TLSEXT_NAMETYPE_HOST_NAME = 0
-
-/** `SSL_set_tlsext_host_name` (a macro over `SSL_ctrl`, whose C `long` differs between targets). */
-internal expect fun sslSetTlsextHostName(ssl: CPointer<SSL>, name: String): Boolean
-
-/** SSL_CTX_set_session_cache_mode, per platform: SSL_CTX_ctrl takes a C `long` (32-bit on Windows). */
-internal expect fun sslCtxSetSessionCacheMode(ctx: CPointer<SSL_CTX>, mode: Int)
 
 /** OpenSSL's names of the cipher suites. */
 internal val CipherSuite.openSslName: String
@@ -397,11 +307,6 @@ internal fun cipherSuiteOf(protocolId: Int): CipherSuite? = when (protocolId) {
     0x1303 -> CipherSuite.TLS13_CHACHA20_POLY1305_SHA256
     else -> null
 }
-
-private const val SSL_OP_NO_COMPRESSION = 0x20000uL // SSL_OP_BIT(17)
-internal const val SSL_CTRL_SET_SESS_CACHE_MODE = 44
-private const val SSL_SESS_CACHE_CLIENT = 0x0001
-private const val SSL_SESS_CACHE_NO_INTERNAL_STORE = 0x0300 // NO_INTERNAL_LOOKUP | NO_INTERNAL_STORE
 
 /** A session ticket a client keeps (rustls `Tls13ClientSessionValue` with its QUIC parameters). */
 internal class ClientTicket(
@@ -451,99 +356,19 @@ internal class TicketCache {
     }
 }
 
-/** An SSL_CTX for QUIC: TLS 1.3 only, the given suites; [configure] adds the rest (tickets and early data per side). */
-private inline fun newQuicContext(suites: List<CipherSuite>, groups: String?, configure: (CPointer<SSL_CTX>) -> Unit): CPointer<SSL_CTX> {
+/**
+ * A QUIC TLS context: TLS 1.3 only, no compression, the given suites (the facade sets them); [create] makes it from the
+ * suites' OpenSSL names and the groups. Bad suites, groups or credentials are refused with the OpenSSL errors.
+ */
+private inline fun quicContext(suites: List<CipherSuite>, groups: String?, create: (List<String>, String?) -> QuicTlsContext): QuicTlsContext {
     require(suites.isNotEmpty()) { "no cipher suites" }
     require(groups == null || (groups.isNotEmpty() && '\u0000' !in groups)) { "invalid groups" }
-    ERR_clear_error()
-    val ctx = SSL_CTX_new(TLS_method()) ?: throw IllegalStateException("SSL_CTX_new failed: ${drainOpenSslErrors()}")
-    try {
-        check(neton_openssl_tls13_only(ctx) == 1) { "TLS 1.3 only: ${drainOpenSslErrors()}" }
-        SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION)
-        val names = suites.distinct().joinToString(":") { it.openSslName }
-        require(SSL_CTX_set_ciphersuites(ctx, names) == 1) { "cipher suites $names: ${drainOpenSslErrors()}" }
-        if (groups != null) require(neton_tls_groups(ctx, groups) == 1) { "groups $groups: ${drainOpenSslErrors()}" }
-        configure(ctx)
-        return ctx
-    } catch (t: Throwable) {
-        SSL_CTX_free(ctx)
-        ERR_clear_error()
-        throw t
+    return try {
+        create(suites.distinct().map { it.openSslName }, groups)
+    } catch (e: neton.openssl.OpenSslException) {
+        throw IllegalArgumentException("TLS configuration: ${e.message}", e)
     }
 }
-
-private fun addTrustAnchors(ctx: CPointer<SSL_CTX>, anchors: Certificates) {
-    val store = SSL_CTX_get_cert_store(ctx) ?: throw IllegalStateException("no certificate store")
-    for (der in anchors.der) {
-        val x = parseDer(der)
-        try {
-            require(X509_STORE_add_cert(store, x) == 1) { "trust anchor: ${drainOpenSslErrors()}" }
-        } finally {
-            X509_free(x)
-        }
-    }
-}
-
-/** Install a certificate chain (leaf first) and its private key; OpenSSL checks that they match. */
-private fun useIdentity(ctx: CPointer<SSL_CTX>, chain: Certificates, key: PrivateKey) {
-    val certs = chain.der.map { parseDer(it) }
-    val stack = OPENSSL_sk_new_null() ?: run { certs.forEach { X509_free(it) }; throw IllegalStateException("out of memory") }
-    val pkey = try { key.load() } catch (t: Throwable) { OPENSSL_sk_free(stack); certs.forEach { X509_free(it) }; throw t }
-    try {
-        for (c in certs.drop(1)) check(OPENSSL_sk_push(stack, c) > 0) { "out of memory" }
-        // Copies the chain and takes its own references to the certificate and key.
-        require(SSL_CTX_use_cert_and_key(ctx, certs[0], pkey, stack.reinterpret(), 1) == 1) {
-            "certificate chain / private key: ${drainOpenSslErrors()}"
-        }
-    } finally {
-        OPENSSL_sk_free(stack)
-        EVP_PKEY_free(pkey)
-        certs.forEach { X509_free(it) }
-    }
-}
-
-internal fun parseDer(der: ByteArray): CPointer<X509> {
-    require(der.isNotEmpty()) { "empty certificate" }
-    ERR_clear_error()
-    val x = der.usePinned { pinned ->
-        memScoped {
-            val p = alloc<CPointerVar<UByteVar>>()
-            p.value = pinned.addressOf(0).reinterpret()
-            val x = d2i_X509(null, p.ptr, der.size.convert())
-            // Trailing bytes after the certificate are rejected.
-            if (x != null && p.value?.rawValue != pinned.addressOf(0).rawValue + der.size.toLong()) {
-                X509_free(x)
-                null
-            } else x
-        }
-    }
-    return x ?: throw IllegalArgumentException("invalid DER certificate: ${drainOpenSslErrors()}")
-}
-
-internal fun toDer(x: CPointer<X509>): ByteArray {
-    val len = i2d_X509(x, null)
-    check(len > 0) { "i2d_X509: ${drainOpenSslErrors()}" }
-    val out = ByteArray(len)
-    out.usePinned { pinned ->
-        memScoped {
-            val p = alloc<CPointerVar<UByteVar>>()
-            p.value = pinned.addressOf(0).reinterpret()
-            check(i2d_X509(x, p.ptr) == len) { "i2d_X509: ${drainOpenSslErrors()}" }
-        }
-    }
-    return out
-}
-
-internal inline fun <T> withMemBio(bytes: ByteArray, block: (CPointer<BIO>) -> T): T {
-    require(bytes.isNotEmpty()) { "empty input" }
-    return bytes.usePinned { pinned ->
-        val bio = BIO_new_mem_buf(pinned.addressOf(0), bytes.size) ?: throw IllegalStateException("BIO_new_mem_buf failed")
-        try { block(bio) } finally { BIO_free(bio) }
-    }
-}
-
-/** The PEM password callback: encrypted keys are refused instead of prompting on the terminal. */
-private val NO_PASSWORD = staticCFunction { _: CPointer<ByteVar>?, _: Int, _: Int, _: COpaquePointer? -> 0 }
 
 internal fun validateAlpn(protocols: List<ByteArray>): List<ByteArray> {
     var total = 0

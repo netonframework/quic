@@ -1,19 +1,12 @@
-@file:OptIn(ExperimentalForeignApi::class)
-
 package neton.quic.proto
 
-import kotlinx.cinterop.ByteVar
-import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.allocArray
-import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.toKString
-import neton.openssl.c.ERR_clear_error
-import neton.openssl.c.neton_openssl_next_error
+import neton.openssl.OpenSsl
 import kotlin.concurrent.AtomicInt
 import kotlin.concurrent.AtomicLong
 
 /**
- * Accounting of the native TLS objects (SSL, SSL_CTX, the StableRefs handed to OpenSSL as callback arguments), so tests
+ * Accounting of the native TLS objects (sessions and contexts of the QUIC TLS facade; StableRefs no longer exist since its
+ * callbacks moved into C, so that count stays 0), so tests
  * can check that closing sessions and configurations — on success, on every failure path, and through the cleaner
  * backstop — really frees them (SPEC §11.6 standard, applied to the TLS layer).
  */
@@ -41,18 +34,10 @@ internal object NativeTls {
 
 /**
  * The OpenSSL error queue is per thread and shared by every connection driven on it. Each OpenSSL call of the TLS layer
- * starts from an empty queue ([ERR_clear_error]) and drains what the call left ([drainOpenSslErrors]), so no error of
+ * starts from an empty queue ([OpenSsl.clearErrors]) and drains what the call left ([drainOpenSslErrors]), so no error of
  * one connection's call is reported by — or changes the outcome of — another's.
  */
-internal fun drainOpenSslErrors(): String = memScoped {
-    val buffer = allocArray<ByteVar>(256)
-    val messages = ArrayList<String>(2)
-    while (neton_openssl_next_error(buffer, 256u) != 0) {
-        if (messages.size < 8) messages += buffer.toKString()
-    }
-    ERR_clear_error()
-    messages.joinToString("; ")
-}
+internal fun drainOpenSslErrors(): String = OpenSsl.takeErrors().split("; ").take(8).joinToString("; ")
 
 /**
  * Exactly-once release shared by an owner's explicit `close()` and the GC cleaner backing it up (the pattern of
