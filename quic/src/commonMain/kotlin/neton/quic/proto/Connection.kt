@@ -213,6 +213,9 @@ class Connection internal constructor(
     /** The number of times a PTO has been sent without receiving an ack. */
     private var ptoCount = 0
 
+    /** The PTO backoff exponent (RFC 9002 `pto_count`), for tests. */
+    internal val ptoBackoff: Int get() = ptoCount
+
     /** Whether the one early resend of RFC 9002 §6.2.3 has been made ([speedUpHandshake]). */
     private var handshakeSpedUp = false
 
@@ -1625,6 +1628,10 @@ class Connection internal constructor(
         space.timeOfLastAckElicitingPacket = Instant.NONE
         space.lossTime = Instant.NONE
         space.sentPackets.drain(drainScratch) { _, packet -> removeInFlight(packet) }
+        // ⚖️ RFC 9002 Appendix A.10 (OnPacketNumberSpaceDiscarded): the PTO backoff restarts. quinn keeps it, so a
+        // client whose Initial PTO backed off without an ACK it may count (§6.2.1) carried that backoff into its first
+        // 1-RTT data (SPEC §11.21).
+        ptoCount = 0
         setLossDetectionTimer(now)
     }
 

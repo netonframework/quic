@@ -417,6 +417,37 @@ class LossyPairTest {
         assertTrue(versionMismatches + timeouts <= 3, "$versionMismatches version mismatches, $timeouts timeouts in 200 connections")
     }
 
+    /**
+     * RFC 9002 Appendix A.10 (SPEC §11.21): discarding a packet number space resets the PTO backoff. The server's
+     * packets are lost for the first 2.5 s, so the client's Initial PTO backs off (a client does not reset it on Initial
+     * ACKs, §6.2.1). When the server's flight gets through, the client sends its Finished and discards the Initial
+     * space: from then on its PTO starts again from the base. Before, the backoff carried over into the Handshake and
+     * application spaces until an ACK the client may count arrived; the interop runner's handshakecorruption failed this
+     * way (quinn server: that ACK was lost, the client's probes came 10 s and 20 s apart and outlived the idle timeout).
+     */
+    @Test
+    fun theInitialBackoffDoesNotCarryIntoTheHandshakeSpace() = keysChecked {
+        val pair = ConnPair.real()
+        pair.latency = 15.milliseconds
+        var initialBackoff = 0
+        var backoffWithFinished = -1
+        pair.serverToClient = LinkImpairment(1).also { it.drop = { _, _ -> pair.time < TEST_EPOCH + 2500.milliseconds } }
+        pair.clientToServer = LinkImpairment(2).also {
+            it.drop = { data, _ ->
+                val backoff = pair.client.connections.keys.firstOrNull()?.let { h -> pair.clientConn(h).ptoBackoff } ?: 0
+                if (!hasHandshake(data)) initialBackoff = maxOf(initialBackoff, backoff)
+                else if (backoffWithFinished < 0) backoffWithFinished = backoff
+                false
+            }
+        }
+        val config = realClientConfig().transportConfig(TransportConfig().initialRtt(100.milliseconds))
+        val (clientCh, serverCh) = connectLossy(pair, config)
+        assertTrue(initialBackoff >= 2, "the Initial PTO did not back off: $initialBackoff")
+        assertEquals(0, backoffWithFinished, "the Initial space's backoff carried over (it reached $initialBackoff)")
+        closeAndDrain(pair, App(pair, clientCh, true))
+        assertNotNull(serverCh)
+    }
+
     // ---- final ACKs ----
 
     @Test

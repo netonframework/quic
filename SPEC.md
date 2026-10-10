@@ -1095,3 +1095,22 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
     该连接正常完成。客户端在一个包都没收到时按标准退避，行为合规；不为此改变密钥份额或退避（属于为测试调参）。这是丢包场景下的统计性
     失败，概率取决于丢包落点与对端的握手时限（I 级，单次运行的分析）。
 
+### 11.21 丢弃包号空间时重置 PTO 退避（RFC 9002 附录 A.10），runner handshakecorruption 的另一个根因（2026-10-11）⚖️
+- **现象**：运行 38078084161（dd1d4b0）中 quinn 服务端 / neton 客户端的 handshakecorruption：客户端以 `ConnectionLost` 结束、缺一个文件。
+- **取证**（客户端一侧与服务端一侧的抓包，用两端 keys.log 解密）：服务端的 Initial（ServerHello）多次损坏，握手在 12.3 s 才完成；客户端在
+  12.30 s 同时发出带 Finished 的 Handshake 包与请求（1-RTT pn 2，STREAM），前者丢失。服务端在握手完成前不处理 1-RTT 包（RFC 9001
+  §5.7），也不确认它们；15.75 s Finished 重传到达后服务端发 HANDSHAKE_DONE（不带 ACK）。此后客户端的 PTO 探测在 22.4 s、42.5 s——
+  间隔 10 s、20 s——且服务端对第一次探测的 ACK 丢失、第二次探测本身丢失；请求一直没有被判丢失重传，空闲超时后连接失败。
+- **根因**：客户端在 Initial 阶段只收到过 Initial 的 ACK（RFC 9002 §6.2.1：客户端不因此重置退避），`ptoCount` 累积到约 5；之后没有任何
+  可计入的 ACK，丢弃 Initial、Handshake 空间时退避原样带进应用数据空间。RFC 9002 附录 A.10 `OnPacketNumberSpaceDiscarded` 在丢弃时
+  `pto_count = 0`；quinn 的 `discard_space` 不重置（本库原样复刻）。
+- **修正** ⚖️：`discardSpace` 中 `ptoCount = 0`。
+- **测试** `LossyPairTest.theInitialBackoffDoesNotCarryIntoTheHandshakeSpace`（真实 TLS）：服务端的包在前 2.5 s 全部丢失，客户端 Initial
+  的退避达到 3；客户端发出 Finished（此时已丢弃 Initial 空间）时退避为 0。去掉修正时失败（"退避被带过去，达到 3"）。经由
+  `Connection.ptoBackoff`（测试用的只读访问）检查。先写的两个按时间测量的版本没有复现：握手阶段的大 RTT 样本使基础 PTO 本身就有 4 s，
+  且测得的"重传"混入了对服务端重传的纯 ACK——改为直接检查规则。
+- 同一运行中另外两项失败均为丢包下的统计性失败（§11.20 末、本节之前的分析）：ngtcp2 服务端 / neton 客户端 connectionmigration 为预期；
+  neton 服务端 / ngtcp2 客户端 handshakecorruption：ngtcp2 首个 ClientHello 只带 X25519 份额，服务端（OpenSSL 默认偏好
+  X25519MLKEM768）回 HelloRetryRequest，之后客户端 14 个数据报丢 7 个、三次 PTO 探测连续丢失，服务端 30 s 空闲时限先到，62.8 s 带
+  完整第二个 ClientHello 的探测到达时连接已丢弃。HRR 多一个往返源自 OpenSSL 的后量子偏好，是安全选择，不为测试更改。
+
