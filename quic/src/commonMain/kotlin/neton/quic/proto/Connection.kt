@@ -2389,14 +2389,19 @@ class Connection internal constructor(
             }
         }
 
-        // PATH_RESPONSE: every queued on-path response that fits (one per challenge, see PathResponses.push)
-        while (buf.len + 9 < maxSize && spaceId == SpaceId.Data) {
-            val token = pathResponses.popOnPath(path.remote) ?: break
-            sent.nonRetransmits = true
-            sent.requiresPadding = true
-            FrameType.PATH_RESPONSE.encode(buf)
-            buf.writeLong(token)
-            stats.frameTx.pathResponse += 1
+        // PATH_RESPONSE: one queued on-path response per packet (one per challenge, see PathResponses.push); the rest
+        // go in the packets that follow, as other implementations send them. Several in one packet are valid, but the
+        // interop runner's rebind check (pyshark) reads only the first PATH_RESPONSE of a packet and reported the
+        // second challenge as unanswered (SPEC §11.20).
+        if (buf.len + 9 < maxSize && spaceId == SpaceId.Data) {
+            val token = pathResponses.popOnPath(path.remote)
+            if (token != null) {
+                sent.nonRetransmits = true
+                sent.requiresPadding = true
+                FrameType.PATH_RESPONSE.encode(buf)
+                buf.writeLong(token)
+                stats.frameTx.pathResponse += 1
+            }
         }
 
         // CRYPTO

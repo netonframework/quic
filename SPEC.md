@@ -1072,5 +1072,13 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
     Handshake 的到达；修正前 1.044 s，只去掉客户端一侧的触发为 1.074 s，修正后 0.5 s 以内；断言客户端确实保留了先于密钥的包（场景有效）。
     默认证书的服务端飞行是两个都以 Initial 开头的数据报，构不成这一场景，故用大证书。
   macOS 两种 TLS 模式各 624 个：621 通过、3 个与 quinn 一致地跳过。
-- **未解决**：ngtcp2 服务端 / neton 客户端的 rebind-port、rebind-addr 时过时不过，connectionmigration 的 127 被记为失败，原因待查（下一步）。
+- **rebind-port / rebind-addr（ngtcp2 服务端 / neton 客户端）**：运行 37927858325 的 rebind-addr，客户端完整下载、退出 0，runner 判失败：
+  "PATH_CHALLENGE without a PATH_RESPONSE: 46:7c:5f:d6:f6:bb:83:60"。解密抓包：客户端 1.069 s 在新路径上以**同一个包中的两个
+  PATH_RESPONSE** 回应了 `ebb12edecd4bcb04` 与 `467c5fd6f6bb8360`。runner（740c05a 的 `testcases_quic.py`）以
+  `getattr(p["quic"], "path_response.data")` 收集回应，pyshark 只返回一个包中该字段的第一个值，第二个回应被漏掉——本库的行为合规（RFC 9000
+  §8.2.2 逐个回显，§11.18），是检查工具读漏。为与这类工具兼容，改为每个包至多一个 PATH_RESPONSE，其余由紧随的包发出（多数实现如此），
+  每个挑战仍逐个回应（`PathResponses` 不变，`PathsTest.pathResponses` 照常）。没有逐包解析帧的连接级测试设施，这一点的证据是之后 runner
+  的 rebind 用例（I 级）。
+- **connectionmigration（ngtcp2 服务端 / neton 客户端）**：本库客户端不迁移到首选地址，以 127 退出（不支持）；runner 对 quinn、quic-go 服务端记为
+  "unsupported"，对 ngtcp2 服务端记为 "failed"，待查 runner 的判定条件。
 
