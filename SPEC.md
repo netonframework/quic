@@ -1084,4 +1084,14 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
   完成下载，但不迁移到首选地址（§0：本库与 quinn 一样只保存其连接 ID），runner 的检查"Server saw only a single path in use"判失败。quinn、
   quic-go 的服务端对该用例以 127 退出，runner 记为 unsupported；ngtcp2 的服务端支持，失败于是落在本库客户端上。客户端迁移到首选地址
   （RFC 9000 §9.6）是功能扩展，按需求单独立项；在此之前这一组合的失败是预期的。
+- **修正后的 runner 结果（运行 38075277647，857aaf4，2026-10-10）**：7 个组合中 5 个全部通过（neton 服务端对 quinn、ngtcp2、quic-go、neton
+  客户端，quinn 服务端对 neton 客户端）；neton 服务端的 handshakeloss / handshakecorruption 全部通过，ngtcp2 服务端 / neton 客户端的
+  rebind-port、rebind-addr 通过（PATH_RESPONSE 每包一个之后）。余下两项失败：
+  - ngtcp2 服务端 / neton 客户端 connectionmigration：上条所述的预期失败。
+  - quic-go 服务端 / neton 客户端 handshakeloss：**不是本库的缺陷**。客户端以 0 退出、50 个文件全部下载；runner 以"服务端 Initial 包中不同 SCID
+    的个数"数握手，得到 51。抓包（服务端一侧）：ClientHello 含 X25519MLKEM768 密钥份额，分成两个 Initial 数据报；客户端按 RFC 9002 的 PTO
+    退避在 0.58、1.58、3.58、7.57 s 发出；模拟器（丢包 30%，突发 3）丢掉第一对、第二对只到了前一半、服务端回的 ACK 也丢失、第三对全丢，
+    服务端自 1.63 s 起 6 s 收不到任何包，超过 quic-go 默认的握手空闲时限 5 s，丢弃了半开的连接；7.62 s 的重发到达时它新建连接（新的 SCID），
+    该连接正常完成。客户端在一个包都没收到时按标准退避，行为合规；不为此改变密钥份额或退避（属于为测试调参）。这是丢包场景下的统计性
+    失败，概率取决于丢包落点与对端的握手时限（I 级，单次运行的分析）。
 
