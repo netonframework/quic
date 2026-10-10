@@ -1049,3 +1049,28 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
 - 测试 `SystemRootsTest`：本机 macOS 157 个根；每张唯一、可构成客户端配置；PEM 读取跳过文本与其他块（Android 的文件格式）、不存在的文件 /
   目录得到空。Linux、Windows 的实际数目由 CI 打印。
 
+### 11.20 握手加速（RFC 9002 §6.2.3），Interop Runner handshakeloss 的根因（2026-10-11）
+- **现象**：Interop Runner 的 handshakeloss / handshakecorruption 时过时不过（§11.18 起记为未解释的失败）。最近三轮（261c780、1e04906、4fcf405）：
+  neton 服务端 / quinn 客户端与 quic-go 服务端 / neton 客户端的这两个用例时过时不过；ngtcp2 服务端 / neton 客户端的 rebind-port、rebind-addr
+  时过时不过（§11.18 的 PATH_RESPONSE 修正之后仍有），connectionmigration 每轮失败（客户端以 127 退出，runner 记为失败）。
+- **取证**：artifact 每个约 220 MiB，以 HTTP Range 只读取 zip 的中央目录与所需文件（运行 37874055516，neton 服务端 / quinn 客户端的
+  handshakeloss）。服务端日志 `handshake failed: TimedOut`，quinn `connection lost: timed out`。按客户端端口拆分服务端一侧的抓包，用两端的
+  keys.log 解密失败的连接：
+  - 3.92 s 服务端的第一个飞行（Initial + Handshake）丢失；4.51 s 客户端的 PTO 重发 ClientHello（重复的 CRYPTO 数据），服务端只回 ACK（也丢失），
+    直到自己的 PTO（初始 RTT 333 ms 时为 999 ms）4.92 s 才重发飞行；
+  - 客户端由此得到约 0.44 s 的 RTT 样本（实际约 30 ms），叠加 Initial 阶段的 PTO 退避（RFC 9002 §6.2.1：客户端不因 Initial 的确认重置退避），
+    PTO 约 5.3 s；客户端的 Finished 在 4.93 s、10.19 s、31.24 s 三次都丢失，超过 30 s 空闲时限，握手失败。
+- **修正**（⚖️，quinn 不实现）：RFC 9002 §6.2.3 允许（MAY）在对端表明本端 Initial 丢失时，提前发送未确认的 CRYPTO 数据，每个连接限次：
+  - 服务端收到只含重复 CRYPTO 数据的 Initial；
+  - 客户端在得到 Handshake 密钥之前收到 Handshake 或 1-RTT 包（即 §11.15 保留的包）。
+  两种情形各在有在途数据的握手空间放一个探测包（与 PTO 探测相同的发送路径，防放大限制照常），整个连接只做一次
+  （"Doing so at most once for each connection is adequate to quickly recover from a single packet loss"）。
+- **测试**（`LossyPairTest`，真实 TLS，单向延迟 15 ms）：
+  - `theServerResendsItsFlightWhenTheClientHelloComesAgain`：服务端的第一个飞行全部丢失，客户端初始 RTT 100 ms；修正前握手在 1.044 s 完成
+    （等服务端的 PTO），修正后在 0.7 s 以内（实测远小于）。
+  - `theClientResendsItsInitialWhenHandshakePacketsComeFirst`：服务端（约 30 KB 证书，飞行跨多个数据报）携带 Initial 的数据报丢失、只含
+    Handshake 的到达；修正前 1.044 s，只去掉客户端一侧的触发为 1.074 s，修正后 0.5 s 以内；断言客户端确实保留了先于密钥的包（场景有效）。
+    默认证书的服务端飞行是两个都以 Initial 开头的数据报，构不成这一场景，故用大证书。
+  macOS 两种 TLS 模式各 624 个：621 通过、3 个与 quinn 一致地跳过。
+- **未解决**：ngtcp2 服务端 / neton 客户端的 rebind-port、rebind-addr 时过时不过，connectionmigration 的 127 被记为失败，原因待查（下一步）。
+

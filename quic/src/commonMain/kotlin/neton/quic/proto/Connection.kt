@@ -213,6 +213,9 @@ class Connection internal constructor(
     /** The number of times a PTO has been sent without receiving an ack. */
     private var ptoCount = 0
 
+    /** Whether the one early resend of RFC 9002 §6.2.3 has been made ([speedUpHandshake]). */
+    private var handshakeSpedUp = false
+
     // Congestion control
 
     /** Whether the most recently received packet had an ECN codepoint set. */
@@ -1174,6 +1177,28 @@ class Connection internal constructor(
         setLossDetectionTimer(now)
     }
 
+    /**
+     * ⚖️ RFC 9002 §6.2.3 (speeding up handshake completion), which quinn does not implement: when the peer shows that
+     * our Initial packets were lost (see the two callers), resend the unacknowledged CRYPTO data now instead of at the
+     * PTO, once per connection ("adequate to quickly recover from a single packet loss"). A probe in each handshake
+     * space with data in flight; it is sent like a PTO probe, so the anti-amplification limit still applies. Without
+     * it a lost server flight waited for the server's PTO (999 ms from the 333 ms initial RTT) even though the
+     * client's retransmission had already arrived, and the late answer inflated the client's RTT sample and so its
+     * PTO: in the interop runner's handshakeloss (server neton, client quinn) the client's PTO reached 5 s and three
+     * lost Finished outlived the idle timeout (SPEC §11.20).
+     */
+    private fun speedUpHandshake() {
+        if (handshakeSpedUp || !state.isHandshake) return
+        var resend = false
+        for (space in HANDSHAKE_SPACE_IDS) {
+            val sp = spaces[space]
+            if (sp.crypto == null || !sp.hasInFlight()) continue
+            sp.lossProbes = saturatingAddU32(sp.lossProbes, 1)
+            resend = true
+        }
+        if (resend) handshakeSpedUp = true
+    }
+
     /** mod.rs:1695 */
     private fun detectLostPackets(now: Instant, pnSpace: SpaceId, dueToAck: Boolean) {
         val lostPackets = lostPackets
@@ -1518,6 +1543,11 @@ class Connection internal constructor(
 
         val sp = spaces[space]
         val end = frame.offset + frame.data.size
+        // RFC 9002 §6.2.3: a server receiving an Initial with CRYPTO data it already has can assume the client did
+        // not receive its Initial packets.
+        if (space == SpaceId.Initial && side.isServer && frame.data.size > 0 && end <= sp.cryptoStream.bytesRead) {
+            speedUpHandshake()
+        }
         if (space < expected && end > sp.cryptoStream.bytesRead) {
             // received new CRYPTO data at an unexpected encryption level
             throw TransportError.PROTOCOL_VIOLATION("new data at unexpected encryption level")
@@ -1667,6 +1697,9 @@ class Connection internal constructor(
     /** Keep a Handshake or 1-RTT packet that came before its keys, while the handshake may still bring them. */
     private fun keepUndecryptable(remote: SocketAddress, ecn: EcnCodepoint?, partialDecode: PartialDecode) {
         if (!state.isHandshake || partialDecode.space == SpaceId.Initial) return
+        // RFC 9002 §6.2.3: a client receiving Handshake or 1-RTT packets before it has Handshake keys can assume
+        // some or all of the server's Initial packets were lost.
+        if (side.isClient && spaces[SpaceId.Handshake].crypto == null) speedUpHandshake()
         if (undecryptable.size >= MAX_UNDECRYPTABLE) return
         undecryptable.addLast(Undecryptable(remote, ecn, partialDecode))
         undecryptableKept++

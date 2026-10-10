@@ -294,6 +294,46 @@ class LossyPairTest {
     }
 
     /**
+     * RFC 9002 §6.2.3, server side (SPEC §11.20): the server's whole first flight is lost; the client's PTO resends its
+     * ClientHello, and the server, seeing CRYPTO data it already has, resends its flight right away instead of waiting
+     * for its own PTO (999 ms from the 333 ms initial RTT). The client's initial RTT is 100 ms, so its PTO comes first.
+     * The interop runner's handshakeloss failed this way (server neton, client quinn): the late resend inflated the
+     * client's RTT sample, its PTO grew to 5 s, and three lost Finished outlived the idle timeout.
+     */
+    @Test
+    fun theServerResendsItsFlightWhenTheClientHelloComesAgain() = keysChecked {
+        val pair = ConnPair.real()
+        pair.latency = 15.milliseconds
+        pair.serverToClient = LinkImpairment(1).also { it.drop = { _, _ -> pair.time < TEST_EPOCH + 150.milliseconds } }
+        val config = realClientConfig().transportConfig(TransportConfig().initialRtt(100.milliseconds))
+        val (clientCh, serverCh) = connectLossy(pair, config)
+        assertTrue(pair.time - TEST_EPOCH < 700.milliseconds, "handshake done at ${pair.time - TEST_EPOCH}")
+        closeAndDrain(pair, App(pair, clientCh, true))
+        assertNotNull(serverCh)
+    }
+
+    /**
+     * RFC 9002 §6.2.3, client side (SPEC §11.20): the server's first flight spans several datagrams (a certificate of
+     * about 30 KB); the ones that carry its Initial packets are lost, the Handshake-only ones arrive. The client, which
+     * cannot decrypt those yet, concludes that the server's Initial was lost and resends its ClientHello right away,
+     * instead of at its PTO (999 ms); the server resends its flight on the duplicate.
+     */
+    @Test
+    fun theClientResendsItsInitialWhenHandshakePacketsComeFirst() = keysChecked {
+        val big = TestTls.bigSelfSigned
+        val pair = ConnPair.new(EndpointConfig.default(), serverConfig(TestTls.serverCrypto(identity = big)))
+        pair.latency = 15.milliseconds
+        // The first flight only: the server's resend on the client's duplicate comes later.
+        pair.serverToClient = LinkImpairment(1).also { it.drop = { data, _ -> isInitial(data) && pair.time < TEST_EPOCH + 30.milliseconds } }
+        val config = ClientConfig(TestTls.clientCrypto(trust = big.certificates, groups = "X25519"))
+        val (clientCh, serverCh) = connectLossy(pair, config)
+        assertTrue(pair.clientConn(clientCh).undecryptableKept > 0, "no Handshake packet came before the Handshake keys")
+        assertTrue(pair.time - TEST_EPOCH < 500.milliseconds, "handshake done at ${pair.time - TEST_EPOCH}")
+        closeAndDrain(pair, App(pair, clientCh, true))
+        assertNotNull(serverCh)
+    }
+
+    /**
      * The server's Initial packets are lost for 10 s while its Handshake packets get through: the client has no
      * Handshake keys (the ServerHello is in the lost Initials) and cannot acknowledge the Handshake probes, which fill
      * the congestion window, while every PTO picks the Handshake space (SPEC §11.17). With a probe in the Initial space
