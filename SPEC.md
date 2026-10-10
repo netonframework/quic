@@ -1079,6 +1079,9 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
   §8.2.2 逐个回显，§11.18），是检查工具读漏。为与这类工具兼容，改为每个包至多一个 PATH_RESPONSE，其余由紧随的包发出（多数实现如此），
   每个挑战仍逐个回应（`PathResponses` 不变，`PathsTest.pathResponses` 照常）。没有逐包解析帧的连接级测试设施，这一点的证据是之后 runner
   的 rebind 用例（I 级）。
-- **connectionmigration（ngtcp2 服务端 / neton 客户端）**：本库客户端不迁移到首选地址，以 127 退出（不支持）；runner 对 quinn、quic-go 服务端记为
-  "unsupported"，对 ngtcp2 服务端记为 "failed"，待查 runner 的判定条件。
+- **connectionmigration（ngtcp2 服务端 / neton 客户端）**：已查明，**是已声明的不支持，不是缺陷**。runner（740c05a 的
+  `TestCaseConnectionMigration.testname`）对服务端传 `connectionmigration`（服务端须通告首选地址）、对**客户端传 `transfer`**；客户端以 0 退出、
+  完成下载，但不迁移到首选地址（§0：本库与 quinn 一样只保存其连接 ID），runner 的检查"Server saw only a single path in use"判失败。quinn、
+  quic-go 的服务端对该用例以 127 退出，runner 记为 unsupported；ngtcp2 的服务端支持，失败于是落在本库客户端上。客户端迁移到首选地址
+  （RFC 9000 §9.6）是功能扩展，按需求单独立项；在此之前这一组合的失败是预期的。
 
