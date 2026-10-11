@@ -15,7 +15,7 @@ run {
 }
 allprojects {
     group = "com.netonstream"
-    version = "0.2.0"
+    version = "0.3.0"
 }
 apply(from = "gradle/publishing.gradle.kts")
 
