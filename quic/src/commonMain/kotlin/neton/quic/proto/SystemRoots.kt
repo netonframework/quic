@@ -1,18 +1,6 @@
-@file:OptIn(ExperimentalForeignApi::class)
-
 package neton.quic.proto
 
-import kotlinx.cinterop.ByteVar
-import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.allocArray
-import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.readBytes
-import kotlinx.cinterop.toKString
 import neton.openssl.QuicTlsCredentials
-import platform.posix.fclose
-import platform.posix.fopen
-import platform.posix.fread
-import platform.posix.getenv
 
 // The operating system's trusted root certificates (rustls-native-certs `load_native_certs`), for clients that verify
 // servers on the public Internet. As rustls-native-certs: `SSL_CERT_FILE` (a PEM bundle) and `SSL_CERT_DIR` (directories
@@ -22,8 +10,8 @@ import platform.posix.getenv
 internal expect fun platformRootsDer(): List<ByteArray>
 
 internal fun systemRootsDer(): List<ByteArray> {
-    val file = getenv("SSL_CERT_FILE")?.toKString()?.ifEmpty { null }
-    val dirs = getenv("SSL_CERT_DIR")?.toKString()?.ifEmpty { null }
+    val file = environmentVariable("SSL_CERT_FILE")?.ifEmpty { null }
+    val dirs = environmentVariable("SSL_CERT_DIR")?.ifEmpty { null }
     val found = if (file != null || dirs != null) {
         val out = ArrayList<ByteArray>()
         if (file != null) readFileOrNull(file)?.let { out += pemCertificates(it) }
@@ -51,25 +39,9 @@ internal fun pemDirectory(dir: String): List<ByteArray> =
 internal expect fun listDirectory(dir: String): List<String>?
 
 /** The whole file, or null when it cannot be opened (missing, a directory on some systems, no permission). */
-internal fun readFileOrNull(path: String): ByteArray? {
-    val f = fopen(path, "rb") ?: return null
-    try {
-        val chunks = ArrayList<ByteArray>()
-        memScoped {
-            val buf = allocArray<ByteVar>(CHUNK)
-            while (true) {
-                val n = fread(buf, 1u, CHUNK.toULong(), f).toInt()
-                if (n <= 0) break
-                chunks += buf.readBytes(n)
-            }
-        }
-        val all = ByteArray(chunks.sumOf { it.size })
-        var at = 0
-        for (c in chunks) { c.copyInto(all, at); at += c.size }
-        return all
-    } finally {
-        fclose(f)
-    }
-}
 
-private const val CHUNK = 64 * 1024
+/** The environment variable [name], or null. */
+internal expect fun environmentVariable(name: String): String?
+
+/** The contents of the file at [path], or null when it cannot be read. */
+internal expect fun readFileOrNull(path: String): ByteArray?

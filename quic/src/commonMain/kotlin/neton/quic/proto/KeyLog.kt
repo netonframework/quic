@@ -1,15 +1,4 @@
-@file:OptIn(ExperimentalForeignApi::class)
-
 package neton.quic.proto
-
-import kotlinx.cinterop.CPointer
-import kotlinx.cinterop.ExperimentalForeignApi
-import kotlinx.cinterop.toKString
-import platform.posix.FILE
-import platform.posix.fflush
-import platform.posix.fopen
-import platform.posix.fputs
-import platform.posix.getenv
 
 /**
  * Receives the TLS secrets of each session, for debugging and for tools that decrypt captured traffic (rustls `KeyLog`).
@@ -30,9 +19,9 @@ interface KeyLog {
  * [path], by default the `SSLKEYLOGFILE` environment variable; with no path, or one that cannot be opened, nothing is
  * logged (as rustls). Shared by any number of configurations and threads.
  */
-class KeyLogFile(path: String? = getenv("SSLKEYLOGFILE")?.toKString()?.ifEmpty { null }) : KeyLog {
+class KeyLogFile(path: String? = environmentVariable("SSLKEYLOGFILE")?.ifEmpty { null }) : KeyLog {
     private val lock = SpinLock()
-    private val file: CPointer<FILE>? = path?.let { fopen(it, "ab") } // binary: no CRLF on Windows
+    private val file: ((String) -> Unit)? = path?.let { openAppendFile(it) }
 
     /** Whether lines are written (a path was given and the file opened). */
     val isOpen: Boolean get() = file != null
@@ -40,10 +29,7 @@ class KeyLogFile(path: String? = getenv("SSLKEYLOGFILE")?.toKString()?.ifEmpty {
     override fun log(label: String, clientRandom: ByteArray, secret: ByteArray) {
         val f = file ?: return
         val line = "$label ${clientRandom.toHex()} ${secret.toHex()}\n"
-        lock.withLock {
-            fputs(line, f)
-            fflush(f)
-        }
+        lock.withLock { f(line) }
     }
 
     private fun ByteArray.toHex(): String {
@@ -79,3 +65,13 @@ private fun hexOrNull(s: String): ByteArray? {
     }
     return out
 }
+
+/** An appender for the file at [path] (created if missing, written in binary, flushed per call), or null. */
+internal expect fun openAppendFile(path: String): ((String) -> Unit)?
+
+/**
+ * Runs [release] on [resource] once the object holding the result becomes unreachable (Kotlin/Native's createCleaner):
+ * a backstop only, explicit close is the release path. Null where there is none (the JVM: bytecode 1.8 has no
+ * java.lang.ref.Cleaner).
+ */
+internal expect fun <T> backstopCleaner(resource: T, release: (T) -> Unit): Any?

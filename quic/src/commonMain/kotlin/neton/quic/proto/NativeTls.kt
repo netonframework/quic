@@ -1,8 +1,12 @@
+@file:OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)
+
 package neton.quic.proto
 
 import neton.openssl.OpenSsl
-import kotlin.concurrent.AtomicInt
-import kotlin.concurrent.AtomicLong
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.incrementAndFetch
+import kotlin.concurrent.atomics.decrementAndFetch
+import kotlin.concurrent.atomics.AtomicLong
 
 /**
  * Accounting of the native TLS objects (sessions and contexts of the QUIC TLS facade; StableRefs no longer exist since its
@@ -16,20 +20,20 @@ internal object NativeTls {
     private val stableRefs = AtomicLong(0)
 
     /** SSL objects created and not yet freed. */
-    val liveSessions: Long get() = sessions.value
+    val liveSessions: Long get() = sessions.load()
 
     /** SSL_CTX references held by configurations and not yet released. */
-    val liveContexts: Long get() = contexts.value
+    val liveContexts: Long get() = contexts.load()
 
     /** Callback StableRefs created and not yet disposed. */
-    val liveStableRefs: Long get() = stableRefs.value
+    val liveStableRefs: Long get() = stableRefs.load()
 
-    fun sessionOpened() { sessions.incrementAndGet() }
-    fun sessionFreed() { sessions.decrementAndGet() }
-    fun contextOpened() { contexts.incrementAndGet() }
-    fun contextFreed() { contexts.decrementAndGet() }
-    fun refCreated() { stableRefs.incrementAndGet() }
-    fun refDisposed() { stableRefs.decrementAndGet() }
+    fun sessionOpened() { sessions.incrementAndFetch() }
+    fun sessionFreed() { sessions.decrementAndFetch() }
+    fun contextOpened() { contexts.incrementAndFetch() }
+    fun contextFreed() { contexts.decrementAndFetch() }
+    fun refCreated() { stableRefs.incrementAndFetch() }
+    fun refDisposed() { stableRefs.decrementAndFetch() }
 }
 
 /**
@@ -46,7 +50,7 @@ internal fun drainOpenSslErrors(): String = OpenSsl.takeErrors().split("; ").tak
 internal class OnceRelease(private val free: () -> Unit) {
     private val released = AtomicInt(0)
 
-    val isReleased: Boolean get() = released.value != 0
+    val isReleased: Boolean get() = released.load() != 0
 
     fun release() {
         if (!released.compareAndSet(0, 1)) return

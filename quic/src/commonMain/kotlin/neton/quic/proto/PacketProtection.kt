@@ -1,13 +1,9 @@
-@file:OptIn(ExperimentalNativeApi::class)
-
 package neton.quic.proto
 
 import neton.openssl.AeadAlgorithm
 import neton.openssl.Crypto
 import neton.openssl.DigestAlgorithm
 import neton.openssl.MaskAlgorithm
-import kotlin.experimental.ExperimentalNativeApi
-import kotlin.native.ref.createCleaner
 import neton.openssl.AeadKey as OpenSslAeadKey
 import neton.openssl.HeaderProtectionKey as OpenSslHeaderProtectionKey
 
@@ -240,7 +236,7 @@ internal class OpenSslPacketKey(suite: CipherSuite, key: ByteArray, private val 
 
     // Only a backstop: the connection closes its keys when it retires them.
     @Suppress("unused")
-    private val cleaner = createCleaner(resource) { it.release() }
+    private val cleaner = backstopCleaner(resource) { it.release() }
 
     override fun close() = resource.release()
 
@@ -307,7 +303,7 @@ internal class OpenSslHeaderKey(suite: CipherSuite, key: ByteArray) : HeaderProt
 
     // Only a backstop: the connection closes its keys when it retires them.
     @Suppress("unused")
-    private val cleaner = createCleaner(resource) { it.release() }
+    private val cleaner = backstopCleaner(resource) { it.release() }
 
     override fun close() = resource.release()
 

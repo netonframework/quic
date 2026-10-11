@@ -1,13 +1,9 @@
-@file:OptIn(ExperimentalNativeApi::class)
-
 package neton.quic.proto
 
 import neton.io.core.secureRandom
 import neton.openssl.AeadAlgorithm
 import neton.openssl.Crypto
 import neton.openssl.DigestAlgorithm
-import kotlin.experimental.ExperimentalNativeApi
-import kotlin.native.ref.createCleaner
 import neton.openssl.AeadKey as OpenSslAeadKey
 
 // Keys for stateless reset tokens and address validation tokens on OpenSSL primitives (quinn-proto
@@ -86,7 +82,7 @@ internal class Aes256GcmZeroNonceKey(key: ByteArray) : AeadKey {
 
     // Only a backstop: token keys are single-use and closed by their caller.
     @Suppress("unused")
-    private val cleaner = createCleaner(resource) { it.release() }
+    private val cleaner = backstopCleaner(resource) { it.release() }
 
     override fun close() = resource.release()
 

@@ -1,9 +1,5 @@
-@file:OptIn(ExperimentalNativeApi::class)
-
 package neton.quic.proto
 
-import kotlin.experimental.ExperimentalNativeApi
-import kotlin.native.ref.createCleaner
 import neton.io.bytes.Buffer
 import neton.io.bytes.Bytes
 import neton.openssl.Crypto
@@ -109,7 +105,7 @@ class TlsSession private constructor(
 
     // Only a backstop: the connection closes the session when it drains.
     @Suppress("unused")
-    private val cleaner = createCleaner(native) { it.release() }
+    private val cleaner = backstopCleaner(native) { it.release() }
 
     /** Which level's keys the connection has: NONE (Initial keys only), HANDSHAKE, then APPLICATION. */
     private var handedLevel = LEVEL_NONE

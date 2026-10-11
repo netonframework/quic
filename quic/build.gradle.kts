@@ -9,9 +9,11 @@ kotlin {
     androidNativeArm64(); androidNativeX64()
 
     sourceSets {
-        commonMain.dependencies { api("com.netonstream:io:0.3.2") }
-        // Packet protection, key derivation and token / reset keys.
-        nativeMain.dependencies { api("com.netonstream:openssl:4.0.2-3") }
+        commonMain.dependencies {
+            api("com.netonstream:io:0.3.2")
+            // TLS through the QUIC TLS facade; packet protection, key derivation and token / reset keys.
+            api("com.netonstream:openssl:4.0.2-3")
+        }
         commonTest.dependencies { implementation(kotlin("test")) }
         // neton-io's IoStream conformance suite (SPEC §3: streams as IoStream, neton-io SPEC §28.6).
         nativeTest.dependencies {

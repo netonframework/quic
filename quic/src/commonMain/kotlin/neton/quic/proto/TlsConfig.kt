@@ -1,12 +1,11 @@
-@file:OptIn(ExperimentalNativeApi::class)
+@file:OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)
 
 package neton.quic.proto
 
 import neton.openssl.QuicTlsContext
 import neton.openssl.QuicTlsCredentials
-import kotlin.concurrent.AtomicInt
-import kotlin.experimental.ExperimentalNativeApi
-import kotlin.native.ref.createCleaner
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.decrementAndFetch
 
 // The TLS 1.3 configurations of the real QUIC TLS layer (quinn-proto `crypto/rustls.rs` `QuicClientConfig` /
 // `QuicServerConfig`, with the certificate handling of quinn's `ClientConfig::with_root_certificates` and
@@ -172,7 +171,7 @@ class TlsClientConfig private constructor(
     }
 
     @Suppress("unused")
-    private val cleaner = createCleaner(ctx) { it.close() }
+    private val cleaner = backstopCleaner(ctx) { it.close() }
 
     override fun startSession(version: Int, serverName: String, params: TransportParameters): CryptoSession =
         TlsSession.client(this, version, serverName, params)
@@ -240,7 +239,7 @@ class TlsServerConfig(
     })
 
     @Suppress("unused")
-    private val cleaner = createCleaner(ctx) { it.close() }
+    private val cleaner = backstopCleaner(ctx) { it.close() }
 
     override fun initialKeys(version: Int, dstCid: ConnectionId): Keys = neton.quic.proto.initialKeys(version, dstCid, Side.Server)
 
@@ -267,19 +266,19 @@ internal class SslContextResource(private val ctx: QuicTlsContext) {
 
     fun <T> use(block: (QuicTlsContext) -> T): T {
         while (true) {
-            val n = users.value
-            check(n >= 0 && closed.value == 0) { "the TLS configuration is closed" }
+            val n = users.load()
+            check(n >= 0 && closed.load() == 0) { "the TLS configuration is closed" }
             if (users.compareAndSet(n, n + 1)) break
         }
         try {
             return block(ctx)
         } finally {
-            if (users.decrementAndGet() == 0 && closed.value != 0) free()
+            if (users.decrementAndFetch() == 0 && closed.load() != 0) free()
         }
     }
 
     fun close() {
-        closed.value = 1
+        closed.store(1)
         free()
     }
 
@@ -329,7 +328,7 @@ internal class TicketCache {
 
     private inline fun <T> locked(block: () -> T): T {
         while (!lock.compareAndSet(0, 1)) { }
-        try { return block() } finally { lock.value = 0 }
+        try { return block() } finally { lock.store(0) }
     }
 
     fun add(server: String, ticket: ClientTicket) = locked {

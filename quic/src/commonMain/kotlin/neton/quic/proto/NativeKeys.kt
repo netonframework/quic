@@ -1,7 +1,11 @@
+@file:OptIn(kotlin.concurrent.atomics.ExperimentalAtomicApi::class)
+
 package neton.quic.proto
 
-import kotlin.concurrent.AtomicInt
-import kotlin.concurrent.AtomicLong
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.incrementAndFetch
+import kotlin.concurrent.atomics.decrementAndFetch
+import kotlin.concurrent.atomics.AtomicLong
 
 /**
  * Accounting of the native cipher contexts QUIC keys hold, so tests can check that retiring keys (discarded spaces,
@@ -11,10 +15,10 @@ internal object NativeKeys {
     private val liveCount = AtomicLong(0)
 
     /** Contexts created and not yet released. */
-    val live: Long get() = liveCount.value
+    val live: Long get() = liveCount.load()
 
-    fun opened() { liveCount.incrementAndGet() }
-    fun released() { liveCount.decrementAndGet() }
+    fun opened() { liveCount.incrementAndFetch() }
+    fun released() { liveCount.decrementAndFetch() }
 }
 
 /**
