@@ -660,6 +660,7 @@ class StreamsState(
 
     internal fun maxConcurrent(dir: Dir): Long = allocatedRemoteCount[dir.ordinal]
 
+    @kotlin.jvm.JvmName("updateSendWindow")
     internal fun setSendWindow(sendWindow: Long) {
         this.sendWindow = sendWindow
     }

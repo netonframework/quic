@@ -7,6 +7,7 @@ import neton.io.net.EcnCodepoint
 // QUIC frames (quinn-proto `frame.rs`; RFC 9000 §19, RFC 9221 DATAGRAM, draft-ietf-quic-ack-frequency).
 
 /** A QUIC frame type (frame.rs:23). */
+@kotlin.jvm.JvmInline
 value class FrameType(val value: Long) {
 
     fun encode(buf: Buffer) = buf.writeVar(value)

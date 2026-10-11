@@ -173,6 +173,7 @@ class TransportConfig {
         return this
     }
 
+    @kotlin.jvm.JvmName("effectiveInitialMtu")
     internal fun getInitialMtu(): Int = maxOf(initialMtu, minMtu)
 
     /**
@@ -516,6 +517,7 @@ class MtuDiscoveryConfig {
  * This wraps an underlying [VarInt], representing the duration in milliseconds. Values can be constructed from a
  * `VarInt` directly, or from a [Duration] with [of].
  */
+@kotlin.jvm.JvmInline
 value class IdleTimeout(val value: VarInt) : Comparable<IdleTimeout> {
     override fun compareTo(other: IdleTimeout): Int = value.compareTo(other.value)
 

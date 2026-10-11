@@ -57,6 +57,7 @@ enum class Dir {
 }
 
 /** Identifier for a stream within a particular connection (lib.rs:233). */
+@kotlin.jvm.JvmInline
 value class StreamId(val value: Long) : Comparable<StreamId> {
     /** Which side of a connection initiated the stream. */
     val initiator: Side get() = if (value and 1L == 0L) Side.Client else Side.Server

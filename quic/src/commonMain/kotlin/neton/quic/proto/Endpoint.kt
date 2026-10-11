@@ -828,6 +828,7 @@ private class ConnectionMeta(
 }
 
 /** Internal identifier for a [Connection] currently associated with an endpoint (endpoint.rs:1144). */
+@kotlin.jvm.JvmInline
 value class ConnectionHandle(val index: Int) {
     override fun toString(): String = "ConnectionHandle($index)"
 }

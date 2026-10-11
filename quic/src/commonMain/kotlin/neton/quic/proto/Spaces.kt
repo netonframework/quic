@@ -661,6 +661,7 @@ internal class Dedup {
  * Indicates which data is available for sending (spaces.rs:602). ⚖️ quinn's `Copy` struct of two flags is a value
  * class over their bits, so returning it allocates nothing.
  */
+@kotlin.jvm.JvmInline
 internal value class SendableFrames private constructor(private val bits: Int) {
     val acks: Boolean get() = bits and ACKS != 0
     val other: Boolean get() = bits and OTHER != 0

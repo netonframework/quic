@@ -402,6 +402,7 @@ sealed class StreamEvent : Event() {
 }
 
 /** Indicates whether a frame needs to be transmitted (mod.rs:525). */
+@kotlin.jvm.JvmInline
 value class ShouldTransmit(
     /** Whether a frame should be transmitted. */
     val shouldTransmit: Boolean,

@@ -1127,3 +1127,17 @@ interop-runner 首轮（§11.16）本库对本库 19 个支持用例中 handshak
 - 依赖 openssl-kotlin 4.0.2-3（含外观，待发布）；本库 CI 的 Windows 作业无法从源码构建 OpenSSL，所以在其发布前此改动留在分支
   `tls-facade`。
 
+### 11.23 JVM 目标（2026-10-11）
+- **结构**：协议层、TLS 层（§11.22 的外观之上）与异步层（Endpoint、Connection、流）全部移到 commonMain；平台相关的只剩 7 个 `expect`：
+  `DEBUG_ASSERTIONS`、`backstopCleaner`（原生为 createCleaner；JVM 无，Java 8 与旧 Android 没有 `java.lang.ref.Cleaner`，显式 close 本是
+  释放路径）、`environmentVariable`、`readFileOrNull`、`listDirectory`、`openAppendFile`（KeyLogFile）、`platformRootsDer`（JVM：默认
+  `TrustManagerFactory` 的信任锚，Android 上即系统 CA 库）。原子量改用 `kotlin.concurrent.atomics`。JVM 需要的源码调整：10 个 value
+  class 加 `@JvmInline`，两处与属性访问器同签名的函数加 `@JvmName`（`setSendWindow`、`getInitialMtu`）。
+- **JVM 目标**：字节码 1.8、API 2.2、stdlib 2.2.21（与 neton-io、openssl-kotlin 相同，供 Kotlin 2.1 的 Android 宿主使用）。UDP 经 neton-io
+  的 NIO 反应器（neton-io SPEC §37：每次接收 1 个数据报，无 GSO / GRO / ECN），TLS 经 openssl-kotlin 的 JNI 库。
+- **验证**（macOS arm64，`--include-build ../io --include-build ../openssl-kotlin`）：原生 624 个通过、3 个跳过；JVM 280 个通过——commonTest 的
+  277 个，加 `JvmEndToEndTest` 3 个（真实 TLS、真实回环 UDP、无测试替身）：16 条双向流各约 64 KiB 回显、期间 3 次密钥更新；带票据的
+  第二个连接在 0-RTT 中发送请求，服务端接受；不信任服务端证书的客户端连接失败。证书为固定夹具（`JvmTestIdentity`），JVM 无法像原生
+  测试那样现场生成。
+- 依赖：neton-io（JVM UDP，main，未发布）与 openssl-kotlin 4.0.2-3（未发布）；在其发布前留在分支 `tls-facade`。
+

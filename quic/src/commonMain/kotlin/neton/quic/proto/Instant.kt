@@ -10,6 +10,7 @@ import kotlin.time.Duration.Companion.nanoseconds
  * in production or from a virtual clock in simulations. ⚖️ A value class over `Long` nanoseconds rather than
  * `kotlin.time.TimeMark`, whose values cannot be constructed freely for virtual time.
  */
+@kotlin.jvm.JvmInline
 value class Instant(val nanos: Long) : Comparable<Instant> {
 
     override fun compareTo(other: Instant): Int = nanos.compareTo(other.nanos)

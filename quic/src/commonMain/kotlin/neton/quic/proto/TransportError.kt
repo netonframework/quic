@@ -5,6 +5,7 @@ import neton.io.bytes.Buffer
 /**
  * Transport-level error code (quinn `transport_error::Code`, transport_error.rs:46; RFC 9000 §20.1).
  */
+@kotlin.jvm.JvmInline
 value class TransportErrorCode(val value: Long) {
 
     fun encode(buf: Buffer) = buf.writeVar(value)

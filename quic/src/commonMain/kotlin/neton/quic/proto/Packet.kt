@@ -69,6 +69,7 @@ sealed class PacketDecodeError(message: String) : Exception(message) {
  * An encoded (truncated) packet number of 1-4 bytes (packet.rs:682): `U8`, `U16`, `U24` or `U32`.
  * Packed into one Long (value in the low 32 bits, length above) so it never allocates.
  */
+@kotlin.jvm.JvmInline
 value class PacketNumber private constructor(private val raw: Long) {
 
     /** Encoded length in bytes, 1..4. */

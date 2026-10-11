@@ -10,6 +10,7 @@ package neton.quic.proto
  * The primary constructor does not check the bound (quinn's `from_u64_unchecked`); use [fromLong]
  * or [fromLongOrNull] for untrusted values.
  */
+@kotlin.jvm.JvmInline
 value class VarInt(val value: Long) : Comparable<VarInt> {
 
     /** Number of bytes needed to encode this value (quinn `VarInt::size`, varint.rs:55). */
