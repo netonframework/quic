@@ -14,8 +14,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macOS kqueue, os: macos-14, task: macosArm64Test, driver: "", tls: "" }
-          - { name: macOS kqueue real TLS, os: macos-14, task: macosArm64Test, driver: "", tls: real }
+          - { name: macOS kqueue, os: macos-15, task: macosArm64Test, driver: "", tls: "" }
+          - { name: macOS kqueue real TLS, os: macos-15, task: macosArm64Test, driver: "", tls: real }
           - { name: Linux epoll real TLS, os: ubuntu-latest, task: linuxX64Test, driver: epoll, tls: real }
           - { name: Linux io_uring, os: ubuntu-latest, task: linuxX64Test, driver: iouring, tls: "" }
           - { name: Windows IOCP, os: windows-latest, task: mingwX64Test, driver: "", tls: "" }
@@ -28,6 +28,9 @@ jobs:
       NETON_QUIC_TEST_TLS: ${{ matrix.tls }}
     steps:
       - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        if: runner.os == 'macOS'
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer" >> "$GITHUB_ENV"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -65,6 +68,64 @@ jobs:
             quic/build/reports/tests/**
           if-no-files-found: ignore
 
+  build-arm64-tests:
+    name: cross-build Linux ARM64 tests
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Link test executables
+        run: ./gradlew --no-daemon :quic:linkDebugTestLinuxArm64 --console=plain
+      - name: Package exact binaries
+        run: |
+          mkdir arm64-tests
+          cp quic/build/bin/linuxArm64/debugTest/test.kexe arm64-tests/quic.kexe
+          cd arm64-tests
+          shasum -a 256 *.kexe > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-tests
+          path: arm64-tests/
+          if-no-files-found: error
+
+  test-arm64:
+    name: test (Linux ARM64 epoll)
+    needs: build-arm64-tests
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      NETON_IO_DRIVER: epoll
+      NETON_QUIC_TEST_TLS: real
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64-tests
+          path: arm64-tests
+      - name: Verify and run native tests
+        working-directory: arm64-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          sha256sum -c SHA256SUMS
+          chmod +x *.kexe
+          for binary in *.kexe; do
+            "./$binary" --ktest_logger=SIMPLE 2>&1 | tee "$binary.log"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-arm64-runtime-results
+          path: arm64-tests/*.log
+          if-no-files-found: error
+
   interop:
     # Two-way interop with quinn 0.11 (rustls): handshakes, key updates, 0-RTT with each side's tickets, rejections
     # (interop/quinn-peer, SPEC §11.9 / §11.14). Fails on any unexpected result.
@@ -79,6 +140,9 @@ jobs:
       NETON_IO_DRIVER: ${{ matrix.driver }}
     steps:
       - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        if: runner.os == 'macOS'
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer" >> "$GITHUB_ENV"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -123,10 +187,13 @@ jobs:
 
   build-all-targets:
     name: compile (all targets)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        if: runner.os == 'macOS'
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer" >> "$GITHUB_ENV"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -149,12 +216,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
         jdk: ['8', '21']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Select supported Xcode
+        if: runner.os == 'macOS'
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer" >> "$GITHUB_ENV"
       - uses: actions/setup-java@v4
         id: test-jdk
         with:
