@@ -26,7 +26,7 @@ kotlin {
         commonMain.dependencies {
             api("com.netonstream:io:0.4.1")
             // TLS through the QUIC TLS facade; packet protection, key derivation and token / reset keys.
-            api("com.netonstream:openssl:4.1.0")
+            api("com.netonstream:openssl:4.1.0-1")
         }
         commonTest.dependencies { implementation(kotlin("test")) }
         // neton-io's IoStream conformance suite (SPEC §3: streams as IoStream, neton-io SPEC §28.6).
